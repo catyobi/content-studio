@@ -114,7 +114,8 @@ def inspect_source(path, ffprobe="ffprobe"):
     if (primaries not in (*UNKNOWN, "bt709") or transfer not in (*UNKNOWN, "bt709")
             or space not in (*UNKNOWN, *matrices)):
         raise EngineError(f"{path.name}: unsupported color profile ({primaries}/{transfer}/{space}); use SDR BT.709 footage.")
-    duration = fraction(video.get("duration"))
+    ticks = fraction(video.get("duration_ts"), 0)
+    duration = ticks * fraction(video.get("time_base"), 0)
     if not duration and fps and 0 < fps <= 60:
         try:
             duration = packet_duration(path, video, fps, ffprobe)

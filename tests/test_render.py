@@ -216,3 +216,15 @@ def test_matroska_longer_audio_does_not_extend_video(tools, tmp_path):
     run(ffmpeg, "-f", "lavfi", "-i", "color=s=96x96:r=30:d=5", "-f", "lavfi", "-i", "sine=d=8",
         "-c:v", "libx264", "-threads:v", "2", "-c:a", "aac", path)
     assert inspect_source(path, ffprobe).frames == 150
+
+
+def test_exact_video_ticks_preserve_minimum_edit_length(tools, tmp_path):
+    ffmpeg, ffprobe = tools
+    counts = [151, 149, 150, 150, 150]
+    paths = [tmp_path / f"clip-{i}.mp4" for i in range(5)]
+    for path, count in zip(paths, counts):
+        run(ffmpeg, "-f", "lavfi", "-i", "color=s=96x96:r=30", "-frames:v", str(count),
+            "-c:v", "libx264", "-threads:v", "2", path)
+    spec = autoedit(paths, root=tmp_path, ffprobe=ffprobe)
+    assert lengths(spec) == counts
+    assert layout(spec)[1] == 750
