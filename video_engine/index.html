@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="request-token" content="__REQUEST_TOKEN__">
+<title>Five-clip video editor</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #f3f5fa; color: #16263b; font: 1rem/1.5 system-ui, sans-serif; }
+  main { max-width: 66rem; margin: auto; padding: clamp(1rem, 4vw, 3rem); }
+  h1, h2 { line-height: 1.2; margin: 0 0 .6rem; }
+  h1 { font-size: clamp(1.8rem, 4vw, 2.6rem); }
+  .intro { margin-bottom: 1.5rem; }
+  .layout { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 1rem; align-items: start; }
+  .card { background: white; border: 1px solid #e1e7ef; border-radius: 1rem; padding: 1.25rem; }
+  fieldset { border: 0; min-width: 0; margin: 0 0 1.3rem; padding: 0; }
+  legend { font-weight: 700; padding: 0; margin-bottom: .6rem; }
+  label { display: block; font-size: .92rem; font-weight: 640; }
+  input, select { display: block; width: 100%; margin: .25rem 0 .65rem; padding: .5rem; min-height: 2.5rem; font: inherit; }
+  input:not([type=file]), select { border: 1px solid #8596a9; border-radius: .35rem; background: white; color: #16263b; }
+  input[type=color] { padding: .2rem; }
+  .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr)); gap: .7rem; }
+  .hint { margin: .25rem 0; color: #42536c; font-size: .92rem; }
+  button, .save { display: inline-block; border: 0; border-radius: .55rem; background: #1b4c87; color: white; padding: .65rem 1rem; font: inherit; font-weight: 700; cursor: pointer; }
+  button:disabled { opacity: .55; cursor: wait; }
+  .save { text-decoration: none; }
+  #status[data-error] { color: #a21f37; }
+  #status { overflow-wrap: anywhere; }
+  video { display: block; width: min(100%, 18rem); max-height: 65vh; margin: 0 auto .9rem; aspect-ratio: 9 / 16; background: #16263b; border-radius: .6rem; }
+  #empty { display: grid; place-items: center; min-height: 11rem; background: #f2f5f9; border-radius: .6rem; color: #42536c; text-align: center; padding: 1rem; }
+  pre { overflow: auto; max-height: 18rem; background: #f2f5f9; padding: .7rem; font-size: .78rem; }
+  [hidden] { display: none !important; }
+  @media (max-width: 45rem) { .layout { grid-template-columns: 1fr; } }
+</style>
+<main>
+  <h1>Five-clip video editor</h1>
+  <p class="intro">Turn five original clips into a branded vertical MP4. Everything runs on this computer.</p>
+  <div class="layout">
+    <form id="editor" class="card">
+      <fieldset>
+        <legend>1. Select five clips</legend>
+        <label for="clips">Original videos</label>
+        <input id="clips" type="file" accept="video/*,.mov,.mp4,.mkv,.webm" required multiple aria-describedby="clip-help">
+        <p class="hint" id="clip-help">Choose all five in the file picker. The first suitable portrait clip opens the edit; the others stay in selection order.</p>
+      </fieldset>
+      <fieldset>
+        <legend>2. Set branding</legend>
+        <label>Title (optional)<input name="text" type="text" maxlength="140" placeholder="e.g., A morning at the studio"></label>
+        <div class="row">
+          <label>Padding<input name="backgroundColor" type="color" value="#102a43"></label>
+          <label>Title text<input name="textColor" type="color" value="#f9c74f"></label>
+          <label>Title panel<input name="panelColor" type="color" value="#102a43"></label>
+        </div>
+        <label>Logo (optional)<input id="logo" type="file" accept=".png,.jpg,.jpeg,.webp"></label>
+        <div class="row">
+          <label>Logo position<select name="logoPosition"><option value="top-right">Top right</option><option value="top-left">Top left</option><option value="bottom-right">Bottom right</option><option value="bottom-left">Bottom left</option></select></label>
+          <label>Logo width (px)<input name="logoWidth" type="number" value="168" min="32" max="480" required></label>
+        </div>
+        <label>Font (optional TTF or OTF)<input id="font" type="file" accept=".ttf,.otf"></label>
+      </fieldset>
+      <fieldset>
+        <legend>3. Choose the edit</legend>
+        <div class="row">
+          <label>Transitions<select name="transition"><option value="dissolve">Dissolve</option><option value="cut">Cut</option></select></label>
+          <label>Framing<select name="fit"><option value="contain">Fit whole shot</option><option value="cover">Crop to fill</option></select></label>
+          <label>Original audio<select name="audio"><option value="keep">Keep</option><option value="mute">Mute</option></select></label>
+        </div>
+      </fieldset>
+      <button id="render">Render video</button>
+      <p id="status" role="status" aria-live="polite"></p>
+    </form>
+    <section class="card" aria-labelledby="preview-title">
+      <h2 id="preview-title">Preview</h2>
+      <p id="empty">Your finished MP4 will appear here.</p>
+      <div id="result" hidden>
+        <video id="video" controls playsinline preload="metadata" aria-label="Rendered video preview"></video>
+        <a class="save" id="save" download="finished-video.mp4">Save MP4</a>
+        <p id="summary" class="hint"></p>
+        <details><summary>Validation report</summary><pre id="report"></pre></details>
+      </div>
+    </section>
+  </div>
+</main>
+<script>
+  const form = document.querySelector('#editor');
+  const token = document.querySelector('meta[name=request-token]').content;
+  const status = document.querySelector('#status');
+  const video = document.querySelector('#video');
+  const result = document.querySelector('#result');
+  const button = document.querySelector('#render');
+
+  async function request(url, method, body, type) {
+    const headers = {'X-Video-Engine-Token': token};
+    if (type) headers['Content-Type'] = type;
+    const response = await fetch(url, {method, headers, body});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Request failed');
+    return data;
+  }
+
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    const clips = Array.from(document.querySelector('#clips').files);
+    status.removeAttribute('data-error');
+    if (clips.length !== 5) {
+      status.setAttribute('data-error', '');
+      status.textContent = 'Select exactly five original clips.';
+      return;
+    }
+    const settings = Object.fromEntries(new FormData(form));
+    settings.logoWidth = Number(settings.logoWidth);
+    const assets = clips.map((clip, i) => [`clip${i + 1}`, clip]);
+    for (const id of ['logo', 'font']) {
+      const asset = document.getElementById(id).files[0];
+      if (asset) assets.push([id, asset]);
+    }
+    button.disabled = true;
+    result.hidden = true;
+    document.querySelector('#empty').hidden = false;
+    video.removeAttribute('src');
+    video.load();
+    try {
+      const {job} = await request('/job', 'POST');
+      for (const [index, [id, file]] of assets.entries()) {
+        status.textContent = `Copying file ${index + 1} of ${assets.length} to local scratch space…`;
+        await request(`/job/${job}/${id}`, 'PUT', file, 'application/octet-stream');
+      }
+      status.textContent = 'Rendering and checking the export…';
+      const report = await request(`/job/${job}/render`, 'POST', JSON.stringify(settings), 'application/json');
+      video.src = `/job/${job}/preview`;
+      document.querySelector('#save').href = `/job/${job}/save`;
+      document.querySelector('#report').textContent = JSON.stringify(report, null, 2);
+      document.querySelector('#summary').textContent = `${report.durationSeconds.toFixed(2)} s · 1080 × 1920 · ${report.audio === 'keep' ? 'Original audio kept' : 'Muted'}`;
+      document.querySelector('#empty').hidden = true;
+      result.hidden = false;
+      status.textContent = 'Export verified. Preview or save your MP4.';
+    } catch (error) {
+      status.setAttribute('data-error', '');
+      status.textContent = error.message;
+    } finally {
+      button.disabled = false;
+    }
+  });
+</script>
+</html>

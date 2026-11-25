@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Video timeline v1",
+  "description": "All frame positions use the output clock. Source positions are relative to the first presented video frame; inFrame is inclusive and outFrame is exclusive. Paths resolve relative to the specification file.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "clips", "transitions", "branding", "audio", "output"],
+  "properties": {
+    "version": {"type": "integer", "const": 1},
+    "clips": {"type": "array", "minItems": 5, "maxItems": 5, "items": {"$ref": "#/$defs/clip"}},
+    "transitions": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"$ref": "#/$defs/transition"}},
+    "branding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["backgroundColor", "textColor", "panelColor", "textOverlays"],
+      "properties": {
+        "backgroundColor": {"$ref": "#/$defs/color"},
+        "textColor": {"$ref": "#/$defs/color"},
+        "panelColor": {"$ref": "#/$defs/color"},
+        "logo": {
+          "type": "object", "additionalProperties": false, "required": ["path", "position", "width"],
+          "properties": {
+            "path": {"$ref": "#/$defs/path"},
+            "position": {"enum": ["top-left", "top-right", "bottom-left", "bottom-right"]},
+            "width": {"type": "integer", "minimum": 32, "maximum": 480}
+          }
+        },
+        "fontFile": {"$ref": "#/$defs/path"},
+        "textOverlays": {"type": "array", "maxItems": 8, "items": {"$ref": "#/$defs/text"}}
+      }
+    },
+    "audio": {"enum": ["keep", "mute"]},
+    "output": {
+      "type": "object", "additionalProperties": false, "required": ["width", "height", "fps"],
+      "properties": {"width": {"type": "integer", "const": 1080}, "height": {"type": "integer", "const": 1920}, "fps": {"type": "integer", "const": 30}}
+    }
+  },
+  "$defs": {
+    "path": {"type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^[^\\u0000]+$"},
+    "color": {"type": "string", "pattern": "^#[0-9a-fA-F]{6}$", "minLength": 7, "maxLength": 7},
+    "clip": {
+      "type": "object", "additionalProperties": false, "required": ["path", "inFrame", "outFrame", "fit"],
+      "properties": {
+        "path": {"$ref": "#/$defs/path"}, "fit": {"enum": ["contain", "cover"]},
+        "inFrame": {"type": "integer", "minimum": 0, "maximum": 5399},
+        "outFrame": {"type": "integer", "minimum": 1, "maximum": 5400}
+      }
+    },
+    "transition": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["type", "frames"], "properties": {"type": {"const": "cut"}, "frames": {"type": "integer", "const": 0}}},
+        {"type": "object", "additionalProperties": false, "required": ["type", "frames"], "properties": {"type": {"const": "dissolve"}, "frames": {"type": "integer", "minimum": 2, "maximum": 30}}}
+      ]
+    },
+    "text": {
+      "type": "object", "additionalProperties": false, "required": ["text", "startFrame", "endFrame", "position"],
+      "properties": {
+        "text": {"type": "string", "minLength": 1, "maxLength": 140},
+        "startFrame": {"type": "integer", "minimum": 0, "maximum": 899},
+        "endFrame": {"type": "integer", "minimum": 1, "maximum": 900},
+        "position": {"enum": ["top", "bottom"]}
+      }
+    }
+  }
+}
