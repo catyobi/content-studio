@@ -1,17 +1,22 @@
 import textwrap
+from pathlib import Path
+from unicodedata import normalize
 
 from PIL import Image, ImageColor, ImageDraw, ImageFont, UnidentifiedImageError
 
 from .timeline import EngineError, asset_path
 
+DEFAULT_FONT = Path(__file__).with_name("fonts") / "NotoSans-Regular.ttf"
+
 
 def title_image(text, color, panel_color, font_file):
+    text = normalize("NFC", text)
     lines = "\n".join(textwrap.wrap(" ".join(text.split()), width=29))
     if not lines:
         raise EngineError("Overlay text must not be blank.")
     draw = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
     for size in (54, 46, 38, 30, 24):
-        font = ImageFont.truetype(font_file, size) if font_file else ImageFont.load_default(size)
+        font = ImageFont.truetype(font_file or DEFAULT_FONT, size)
         box = draw.multiline_textbbox((0, 0), lines, font=font, spacing=8)
         width, height = box[2] - box[0] + 40, box[3] - box[1] + 28
         if width <= 936 and height <= 300:

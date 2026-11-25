@@ -11,6 +11,7 @@ from urllib.request import Request, urlopen
 import pytest
 from PIL import Image
 
+from video_engine.branding import title_image
 from video_engine.media import command, inspect_source, require_tools
 from video_engine.planner import autoedit
 from video_engine.renderer import render
@@ -104,6 +105,22 @@ def assert_audio_markers(ffmpeg, output, spec, order):
                 assert len(visual_starts) >= 5 and len(audio_starts) >= 5
                 assert all(min(abs(n - a) for a in audio_starts) <= 1 or n in (interior.start, interior.stop-1)
                            for n in visual_starts), (visual_starts, audio_starts, clip)
+
+
+def test_default_title_rasterizes_unicode_glyphs():
+    def glyph(text):
+        image = title_image(text, "#FFFFFF", "#000000", None)
+        ink = image.getchannel("R")
+        assert (bounds := ink.getbbox()) is not None
+        return ink.crop(bounds)
+
+    missing = glyph("\U0010ffff")
+    for character in "éñüç·—‘’“”:'\\%,":
+        rendered = glyph(character)
+        assert (rendered.size, rendered.tobytes()) != (missing.size, missing.tobytes()), character
+    for accented, plain in zip("éñüç", "enuc"):
+        assert glyph(accented) != glyph(plain)
+    assert glyph("café") == glyph("cafe\u0301")
 
 
 def test_dissolves_audio_rotation_and_originals(clips, tools, tmp_path):
