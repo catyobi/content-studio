@@ -45,7 +45,8 @@ def build_graph(spec, sources, overlays):
             if keep:
                 graph.append(f"[{audio}][a{i}]acrossfade=ns={overlap*SAMPLES_PER_FRAME}[am{i}]")
         else:
-            graph.append(f"[{video}][v{i}]concat=n=2:v=1:a=0,settb=1/{FPS}[vm{i}]")
+            single_frame_clock = ",setpts=N" if starts[i] == 1 else ""
+            graph.append(f"[{video}][v{i}]concat=n=2:v=1:a=0,settb=1/{FPS}{single_frame_clock}[vm{i}]")
             if keep:
                 graph.append(f"[{audio}][a{i}]concat=n=2:v=0:a=1[am{i}]")
         video, audio = f"vm{i}", f"am{i}"

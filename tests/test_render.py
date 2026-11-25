@@ -228,3 +228,16 @@ def test_exact_video_ticks_preserve_minimum_edit_length(tools, tmp_path):
     spec = autoedit(paths, root=tmp_path, ffprobe=ffprobe)
     assert lengths(spec) == counts
     assert layout(spec)[1] == 750
+
+
+def test_cut_after_one_frame_opener_preserves_timeline(clips, tools, tmp_path):
+    ffmpeg, ffprobe = tools
+    spec = autoedit(clips, root=tmp_path, ffprobe=ffprobe, transition="cut", audio="mute")
+    for clip, count in zip(spec["clips"], (1, 188, 188, 188, 188)):
+        clip.update(inFrame=0, outFrame=count)
+    output = tmp_path / "one-frame-opener.mp4"
+    report = render(spec, output, root=tmp_path, ffmpeg=ffmpeg, ffprobe=ffprobe)
+    assert report["continuousTimestamps"] and report["frames"] == 753
+    assert report["joins"][0]["startFrame"] == 1
+    samples = pixels(ffmpeg, output, 700, 964)
+    assert not identity_errors(samples, [1, 0, 2, 3, 4], layout(spec)[0], spec["transitions"])
