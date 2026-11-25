@@ -2,7 +2,7 @@ import textwrap
 from pathlib import Path
 from unicodedata import normalize
 
-from PIL import Image, ImageColor, ImageDraw, ImageFont, UnidentifiedImageError
+from PIL import Image, ImageColor, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 
 from .timeline import EngineError, asset_path
 
@@ -36,7 +36,7 @@ def prepare_overlays(brand, root, scratch):
             with Image.open(source) as image:
                 if image.format not in ("PNG", "JPEG", "WEBP") or image.width * image.height > 16_000_000:
                     raise EngineError("Use a PNG, JPEG or WebP logo of at most 16 megapixels.")
-                image = image.convert("RGBA")
+                image = ImageOps.exif_transpose(image).convert("RGBA")
                 image.thumbnail((logo["width"], 240), Image.Resampling.LANCZOS)
                 path = scratch / "logo.png"
                 image.save(path)

@@ -11,7 +11,7 @@ from urllib.request import Request, urlopen
 import pytest
 from PIL import Image
 
-from video_engine.branding import title_image
+from video_engine.branding import prepare_overlays, title_image
 from video_engine.media import command, inspect_source, require_tools
 from video_engine.planner import autoedit
 from video_engine.renderer import render
@@ -254,3 +254,18 @@ def test_opener_uses_rotated_display_aspect_ratio(clips, tools, tmp_path):
     assert not inspect_source(rotated, ffprobe).portrait
     spec = autoedit([clips[0], path, *clips[2:]], root=tmp_path, ffprobe=ffprobe)
     assert spec["clips"][0]["path"] == path.name
+
+
+def test_logo_honors_exif_orientation(tmp_path):
+    path = tmp_path / "rotated.jpg"
+    exif = Image.Exif()
+    exif[274] = 6
+    source = Image.new("RGB", (80, 40), "red")
+    source.paste("blue", (40, 0, 80, 40))
+    source.save(path, exif=exif)
+    brand = {"logo": {"path": path.name, "position": "top-right", "width": 80}, "textOverlays": []}
+    overlay, *_ = prepare_overlays(brand, tmp_path, tmp_path)[0]
+    with Image.open(overlay) as logo:
+        assert logo.size == (40, 80)
+        assert logo.getpixel((20, 20)) == pytest.approx((255, 0, 0, 255), abs=5)
+        assert logo.getpixel((20, 60)) == pytest.approx((0, 0, 255, 255), abs=5)
