@@ -10,7 +10,7 @@ from .timeline import EngineError, asset_path, validate_spec
 from .verify import assert_branches, verify
 
 
-def render(spec, output, *, root, ffmpeg="ffmpeg", ffprobe="ffprobe"):
+def render(spec, output, *, root, ffmpeg="ffmpeg", ffprobe="ffprobe", source_cache=None):
     spec = validate_spec(spec)
     require_tools(ffmpeg, ffprobe)
     target = Path(output).absolute()
@@ -18,7 +18,8 @@ def render(spec, output, *, root, ffmpeg="ffmpeg", ffprobe="ffprobe"):
         raise EngineError("Specify an .mp4 path in an existing output directory.")
     if target.exists() or target.is_symlink():
         raise EngineError("Output already exists; choose a new filename. Sources are never overwritten.")
-    sources = [inspect_source(asset_path(root, item["path"]), ffprobe, ffmpeg=ffmpeg) for item in spec["clips"]]
+    sources = [inspect_source(asset_path(root, item["path"]), ffprobe, ffmpeg=ffmpeg, source_cache=source_cache)
+               for item in spec["clips"]]
     for i, (clip, source) in enumerate(zip(spec["clips"], sources), 1):
         if clip["outFrame"] > source.frames:
             raise EngineError(f"Clip {i} trim exceeds available media ({source.frames} normalized frames).")

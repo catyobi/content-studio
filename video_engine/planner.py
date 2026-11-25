@@ -48,8 +48,9 @@ def plan(sources, *, root, transition="dissolve", fit="contain", audio="keep", b
     return validate_spec(spec)
 
 
-def autoedit(paths, *, root, ffmpeg="ffmpeg", ffprobe="ffprobe", **options):
+def autoedit(paths, *, root, ffmpeg="ffmpeg", ffprobe="ffprobe", source_cache=None, **options):
     if len(paths) != 5:
         raise EngineError("Select exactly five distinct clips.")
-    sources = [inspect_source(asset_path(Path.cwd(), path), ffprobe, ffmpeg=ffmpeg) for path in paths]
+    sources = [inspect_source(asset_path(Path.cwd(), path), ffprobe, ffmpeg=ffmpeg, source_cache=source_cache)
+               for path in paths]
     return plan(sources, root=root, **options)

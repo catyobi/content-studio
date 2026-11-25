@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 import pytest
 from PIL import Image
 
+from video_engine import media
 from video_engine.branding import prepare_overlays, title_image
 from video_engine.media import command, inspect_source, require_tools
 from video_engine.planner import autoedit
@@ -70,7 +71,7 @@ def pixels(ffmpeg, output, x, y):
     return [tuple(statistics.mean(raw[i+c:i+192:3]) for c in range(3)) for i in range(0, len(raw), 192)]
 
 
-def identity_errors(samples, order, starts, transitions):
+def identity_errors(samples, order, starts, transitions, *, tolerance=15):
     failures = []
     for frame, rgb in enumerate(samples):
         i = max(i for i, start in enumerate(starts) if frame >= start)
@@ -78,7 +79,7 @@ def identity_errors(samples, order, starts, transitions):
         if i and (overlap := transitions[i-1]["frames"]) and frame < starts[i] + overlap:
             r = (frame - starts[i])/overlap
             color = tuple(a*(1-r) + b*r for a, b in zip(RGB[order[i-1]], color))
-        if max(abs(x-y) for x, y in zip(color, rgb)) > 15:
+        if max(abs(x-y) for x, y in zip(color, rgb)) > tolerance:
             failures.append(frame)
     return failures
 
@@ -156,9 +157,17 @@ def test_dissolves_audio_rotation_and_originals(clips, tools, tmp_path):
     assert_audio_markers(ffmpeg, output, spec, order)
 
 
-def test_local_upload_cut_muted_preview_and_save(clips, tools, tmp_path):
+def test_local_upload_cut_muted_preview_and_save(clips, tools, tmp_path, monkeypatch):
     ffmpeg, ffprobe = tools
     original = checksums(clips)
+    scans = []
+    count_frames = media.decoded_frame_count
+
+    def track_scan(path, *args):
+        scans.append(path.name)
+        return count_frames(path, *args)
+
+    monkeypatch.setattr(media, "decoded_frame_count", track_scan)
     with LocalServer(0, tmp_path, ffmpeg, ffprobe) as server:
         worker = threading.Thread(target=server.serve_forever)
         worker.start()
@@ -180,6 +189,7 @@ def test_local_upload_cut_muted_preview_and_save(clips, tools, tmp_path):
             settings = {"transition": "cut", "audio": "mute", "fit": "cover", "text": "Second brand",
                         "backgroundColor": "#C52E51", "textColor": "#FFFFFF", "panelColor": "#C52E51"}
             report = json.load(request(f"/job/{job}/render", "POST", json.dumps(settings).encode(), **token))
+            assert scans == list(CLIPS)
             print(f"Cut/mute UI: {report['renderSeconds']}s render, {report['validationSeconds']}s validation, {report['bytes']} bytes")
             assert report["audio"] == "mute" and report["audioDurationSeconds"] is None and report["frames"] == 810
             with request(f"/job/{job}/preview", Range="bytes=0-15") as preview:
@@ -196,6 +206,36 @@ def test_local_upload_cut_muted_preview_and_save(clips, tools, tmp_path):
         finally:
             server.shutdown()
             worker.join()
+
+
+@pytest.mark.parametrize("audio", ["keep", "mute"])
+def test_mixed_joins_export(clips, tools, tmp_path, audio):
+    ffmpeg, ffprobe = tools
+    spec = autoedit(clips, root=tmp_path, ffmpeg=ffmpeg, ffprobe=ffprobe, audio=audio)
+    for i in (0, 2):
+        spec["transitions"][i] = {"type": "cut", "frames": 0}
+    output = tmp_path / "mixed.mp4"
+    report = render(spec, output, root=tmp_path, ffmpeg=ffmpeg, ffprobe=ffprobe)
+    assert report["video"] == VIDEO_PROFILE and report["fastStart"] and report["continuousTimestamps"]
+    assert report["frames"] == 846 and report["durationSeconds"] == pytest.approx(28.2)
+    assert report["audio"] == audio
+    assert [(join["type"], join["startFrame"], join["firstFullyIncomingFrame"]) for join in report["joins"]] == [
+        ("cut", 177, 177), ("dissolve", 336, 354), ("cut", 512, 512), ("dissolve", 670, 688),
+    ]
+    samples = pixels(ffmpeg, output, 700, 964)
+    assert len(samples) == 846
+    order = [1, 0, 2, 3, 4]
+    starts, _ = layout(spec)
+    assert not identity_errors(samples, order, starts, spec["transitions"], tolerance=8)
+    for i in range(1, len(starts)):
+        delayed = [*starts]
+        delayed[i] += 1
+        assert identity_errors(samples, order, delayed, spec["transitions"], tolerance=8)
+    if audio == "keep":
+        assert report["audioDurationSeconds"] == pytest.approx(28.2, abs=1/30)
+        assert_audio_markers(ffmpeg, output, spec, order)
+    else:
+        assert report["audioDurationSeconds"] is None
 
 
 def test_rejects_invalid_and_hdr_without_export(tools, tmp_path):
@@ -217,6 +257,29 @@ def test_matroska_longer_audio_does_not_extend_video(tools, tmp_path):
     run(ffmpeg, "-f", "lavfi", "-i", "color=s=96x96:r=30:d=5", "-f", "lavfi", "-i", "sine=d=8",
         "-c:v", "libx264", "-threads:v", "2", "-c:a", "aac", path)
     assert inspect_source(path, ffprobe, ffmpeg=ffmpeg).frames == 150
+
+
+def test_source_cache_invalidates_same_size_replacement(clips, tools, tmp_path):
+    ffmpeg, ffprobe = tools
+    path = tmp_path / "clip.mp4"
+    path.write_bytes(clips[0].read_bytes())
+    cache = {}
+
+    def inspect():
+        return inspect_source(path, ffprobe, ffmpeg=ffmpeg, source_cache=cache)
+
+    original = inspect()
+    assert inspect() is original
+    before = path.stat()
+    replacement = tmp_path / "replacement.mp4"
+    replacement.write_bytes(path.read_bytes())
+    os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+    replacement.replace(path)
+    after = path.stat()
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+    updated = inspect()
+    assert updated is not original
+    assert inspect() is updated
 
 
 def test_exact_video_ticks_preserve_minimum_edit_length(tools, tmp_path):

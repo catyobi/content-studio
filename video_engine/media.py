@@ -82,9 +82,19 @@ class Source:
         return display_width > self.height if self.rotation in (90, 270) else self.height > display_width
 
 
-def inspect_source(path, ffprobe="ffprobe", *, ffmpeg="ffmpeg"):
-    if path.stat().st_size > MAX_BYTES:
+def source_signature(stat):
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+def inspect_source(path, ffprobe="ffprobe", *, ffmpeg="ffmpeg", source_cache=None):
+    stat = path.stat()
+    if stat.st_size > MAX_BYTES:
         raise EngineError(f"{path.name}: source exceeds 1 GiB.")
+    if source_cache is not None:
+        signature = source_signature(stat)
+        key = path, ffmpeg, ffprobe, signature
+        if key in source_cache:
+            return source_cache[key]
     try:
         info = probe(path, "-show_streams", "-show_format", ffprobe=ffprobe)
     except EngineError as exc:
@@ -124,5 +134,10 @@ def inspect_source(path, ffprobe="ffprobe", *, ffmpeg="ffmpeg"):
     ) else None
     start = fraction(video.get("start_time"), fraction(container.get("start_time"), Fraction(0)))
     sar = fraction((video.get("sample_aspect_ratio") or "").replace(":", "/"), Fraction(1))
-    return Source(path, video["index"], audio, width, height, rotation, frames, start,
-                  matrices.get(space, "bt709"), "pc" if full else "tv", warning, sar=sar if sar > 0 else Fraction(1))
+    source = Source(path, video["index"], audio, width, height, rotation, frames, start,
+                    matrices.get(space, "bt709"), "pc" if full else "tv", warning, sar=sar if sar > 0 else Fraction(1))
+    if source_cache is not None:
+        if source_signature(path.stat()) != signature:
+            raise EngineError(f"{path.name}: source changed during inspection; try again.")
+        source_cache[key] = source
+    return source
