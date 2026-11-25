@@ -9,13 +9,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .media import MAX_BYTES, require_tools
-from .planner import autoedit
+from .media import MAX_BYTES, inspect_source, require_tools
+from .planner import plan
 from .renderer import render
-from .timeline import EngineError
+from .timeline import EngineError, asset_path
 
 CLIPS = tuple(f"clip{i}" for i in range(1, 6))
-JOB = re.compile(r"/job/([0-9a-f]{32})/(clip[1-5]|logo|font|render|preview|save)")
+JOB = re.compile(r"/job/([0-9a-f]{32})/(clip[1-5]|logo|font|render|status|preview|save)")
+REQUEST_TIMEOUT = 20
+UPLOAD_IDLE_TIMEOUT = 120
 
 
 class RequestError(Exception):
@@ -46,6 +48,7 @@ class LocalServer(ThreadingHTTPServer):
         self.current = None
         self.lock = threading.Lock()
         self.busy = False
+        self.progress = None
         self.hosts = {f"127.0.0.1:{self.server_port}", f"localhost:{self.server_port}"}
         self.index = Path(__file__).with_name("index.html").read_text(encoding="utf-8").replace("__REQUEST_TOKEN__", self.token)
 
@@ -54,7 +57,7 @@ class Handler(BaseHTTPRequestHandler):
     server: LocalServer
 
     def setup(self):
-        self.request.settimeout(20)
+        self.request.settimeout(REQUEST_TIMEOUT)
         super().setup()
 
     def send_bytes(self, status, content, kind):
@@ -100,23 +103,46 @@ class Handler(BaseHTTPRequestHandler):
         return self.server.folder / key
 
     def upload(self, key, name):
+        label = f"Clip {CLIPS.index(name) + 1}" if name in CLIPS else name.capitalize()
+        try:
+            with self.server.lock:
+                job = self.job_folder(key)
+                if self.server.busy or (job / "export.mp4").exists():
+                    raise RequestError(409, "This job no longer accepts uploads.")
+                length = self.length(MAX_BYTES if name in CLIPS else 16 * 1024**2)
+                partial = job / f"{name}.partial"
+                self.request.settimeout(UPLOAD_IDLE_TIMEOUT)
+                try:
+                    with partial.open("wb") as handle:
+                        while length:
+                            try:
+                                chunk = self.rfile.read1(min(length, 1024**2))
+                            except TimeoutError as exc:
+                                raise RequestError(408, f"No data arrived for {UPLOAD_IDLE_TIMEOUT:g} seconds. "
+                                                   "Make sure the file is available on this computer and try again.") from exc
+                            if not chunk:
+                                raise RequestError(400, "The file transfer ended before all bytes arrived. Try again.")
+                            handle.write(chunk)
+                            length -= len(chunk)
+                    partial.replace(job / name)
+                finally:
+                    self.request.settimeout(REQUEST_TIMEOUT)
+                    partial.unlink(missing_ok=True)
+        except RequestError as exc:
+            raise RequestError(exc.status, f"{label} upload: {exc}") from exc
+        except (BrokenPipeError, ConnectionResetError):
+            raise
+        except OSError as exc:
+            raise RequestError(500, f"{label} upload: unable to save the local copy ({exc}). Check available disk space.") from exc
+
+    def set_progress(self, message):
         with self.server.lock:
-            job = self.job_folder(key)
-            if self.server.busy or (job / "export.mp4").exists():
-                raise RequestError(409, "This job no longer accepts uploads.")
-            length = self.length(MAX_BYTES if name in CLIPS else 16 * 1024**2)
-            partial = job / f"{name}.partial"
-            try:
-                with partial.open("wb") as handle:
-                    while length:
-                        chunk = self.rfile.read(min(length, 1024**2))
-                        if not chunk:
-                            raise RequestError(400, "Incomplete upload.")
-                        handle.write(chunk)
-                        length -= len(chunk)
-                partial.replace(job / name)
-            finally:
-                partial.unlink(missing_ok=True)
+            self.server.progress = message
+
+    def status(self, key):
+        with self.server.lock:
+            self.job_folder(key)
+            return {"progress": self.server.progress}
 
     def export(self, key):
         try:
@@ -132,6 +158,7 @@ class Handler(BaseHTTPRequestHandler):
             if not all((job / clip).is_file() for clip in CLIPS):
                 raise RequestError(400, "Upload all five clips before rendering.")
             self.server.busy = True
+            self.server.progress = "Reading edit settings"
         try:
             branding = {"backgroundColor": settings.get("backgroundColor", "#102A43"),
                         "textColor": settings.get("textColor", "#F9C74F"),
@@ -146,14 +173,26 @@ class Handler(BaseHTTPRequestHandler):
             if (job / "font").exists():
                 branding["fontFile"] = "font"
             source_cache = {}
-            spec = autoedit([str(job / clip) for clip in CLIPS], root=job, ffmpeg=self.server.ffmpeg, ffprobe=self.server.ffprobe,
-                            transition=settings.get("transition", "dissolve"), fit=settings.get("fit", "contain"),
-                            audio=settings.get("audio", "keep"), branding=branding, source_cache=source_cache)
+            sources = []
+            for i, clip in enumerate(CLIPS, 1):
+                self.set_progress(f"Probing clip {i} of {len(CLIPS)}")
+                sources.append(inspect_source(asset_path(job, clip), self.server.ffprobe, ffmpeg=self.server.ffmpeg,
+                                              source_cache=source_cache,
+                                              on_decode=lambda: self.set_progress(f"Decoding clip {i} of {len(CLIPS)}")))
+            self.set_progress("Planning the edit")
+            spec = plan(sources, root=job, transition=settings.get("transition", "dissolve"),
+                        fit=settings.get("fit", "contain"), audio=settings.get("audio", "keep"), branding=branding)
+            self.set_progress("Rendering the video")
             report = render(spec, job / "export.mp4", root=job, ffmpeg=self.server.ffmpeg, ffprobe=self.server.ffprobe,
-                            source_cache=source_cache)
+                            source_cache=source_cache, on_verify=lambda: self.set_progress("Checking the exported MP4"))
+        except EngineError as exc:
+            raise EngineError(f"{self.server.progress} failed: {exc}") from exc
+        except OSError as exc:
+            raise RequestError(500, f"{self.server.progress} failed: local I/O error ({exc}).") from exc
         finally:
             with self.server.lock:
                 self.server.busy = False
+                self.server.progress = None
         return report
 
     def video(self, key, download):
@@ -211,6 +250,9 @@ class Handler(BaseHTTPRequestHandler):
             elif action == "POST" and job and job[2] == "render":
                 self.require_token()
                 self.send_json(self.export(job[1]))
+            elif action == "GET" and job and job[2] == "status":
+                self.require_token()
+                self.send_json(self.status(job[1]))
             elif action == "PUT" and job and job[2] in (*CLIPS, "logo", "font"):
                 self.require_token()
                 self.upload(job[1], job[2])

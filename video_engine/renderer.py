@@ -10,7 +10,7 @@ from .timeline import EngineError, asset_path, validate_spec
 from .verify import assert_branches, verify
 
 
-def render(spec, output, *, root, ffmpeg="ffmpeg", ffprobe="ffprobe", source_cache=None):
+def render(spec, output, *, root, ffmpeg="ffmpeg", ffprobe="ffprobe", source_cache=None, on_verify=None):
     spec = validate_spec(spec)
     require_tools(ffmpeg, ffprobe)
     target = Path(output).absolute()
@@ -50,6 +50,8 @@ def render(spec, output, *, root, ffmpeg="ffmpeg", ffprobe="ffprobe", source_cac
                     details = reader.read().decode(errors="replace").strip()
                 raise EngineError(f"{exc}\n{details}".strip()) from exc
         render_time = perf_counter() - started
+        if on_verify is not None:
+            on_verify()
         started = perf_counter()
         assert_branches(spec, log_path.read_text(encoding="utf-8", errors="replace"))
         report = verify(pending, spec, ffmpeg=ffmpeg, ffprobe=ffprobe)

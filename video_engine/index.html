@@ -98,6 +98,40 @@
     return data;
   }
 
+  function upload(url, file, label) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('PUT', url);
+      xhr.setRequestHeader('X-Video-Engine-Token', token);
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+      xhr.responseType = 'json';
+      const message = `Uploading ${label} (${file.name})`;
+      status.textContent = `${message}…`;
+      xhr.upload.onprogress = event => {
+        if (event.lengthComputable) status.textContent = `${message} — ${Math.floor(event.loaded / event.total * 100)}%`;
+      };
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) resolve();
+        else reject(new Error(xhr.response?.error || `${label} upload failed (HTTP ${xhr.status}).`));
+      };
+      xhr.onerror = xhr.onabort = () => reject(new Error(`${label} upload stopped. Check that the file is available locally and try again.`));
+      xhr.send(file);
+    });
+  }
+
+  async function watchProgress(job, active) {
+    while (active()) {
+      await new Promise(resolve => setTimeout(resolve, 350));
+      if (!active()) return;
+      try {
+        const {progress} = await request(`/job/${job}/status`, 'GET');
+        if (active() && progress) status.textContent = `${progress}…`;
+      } catch {
+        if (active()) status.textContent = 'Waiting for an update from the local editor…';
+      }
+    }
+  }
+
   form.addEventListener('submit', async event => {
     event.preventDefault();
     const clips = Array.from(document.querySelector('#clips').files);
@@ -122,11 +156,18 @@
     try {
       const {job} = await request('/job', 'POST');
       for (const [index, [id, file]] of assets.entries()) {
-        status.textContent = `Copying file ${index + 1} of ${assets.length} to local scratch space…`;
-        await request(`/job/${job}/${id}`, 'PUT', file, 'application/octet-stream');
+        const label = index < clips.length ? `clip ${index + 1} of ${clips.length}` : id;
+        await upload(`/job/${job}/${id}`, file, label);
       }
-      status.textContent = 'Rendering and checking the export…';
-      const report = await request(`/job/${job}/render`, 'POST', JSON.stringify(settings), 'application/json');
+      let rendering = true;
+      status.textContent = 'Waiting to inspect clip 1 of 5…';
+      watchProgress(job, () => rendering);
+      let report;
+      try {
+        report = await request(`/job/${job}/render`, 'POST', JSON.stringify(settings), 'application/json');
+      } finally {
+        rendering = false;
+      }
       video.src = `/job/${job}/preview`;
       document.querySelector('#save').href = `/job/${job}/save`;
       document.querySelector('#report').textContent = JSON.stringify(report, null, 2);

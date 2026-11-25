@@ -1,9 +1,14 @@
 import hashlib
+import http.client
 import json
 import os
+import select
 import statistics
+import subprocess
 import threading
 from array import array
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from fractions import Fraction
 from pathlib import Path
 from urllib.error import HTTPError
@@ -12,7 +17,7 @@ from urllib.request import Request, urlopen
 import pytest
 from PIL import Image
 
-from video_engine import media
+from video_engine import media, server as web
 from video_engine.branding import prepare_overlays, title_image
 from video_engine.media import command, inspect_source, require_tools
 from video_engine.planner import autoedit
@@ -206,6 +211,91 @@ def test_local_upload_cut_muted_preview_and_save(clips, tools, tmp_path, monkeyp
         finally:
             server.shutdown()
             worker.join()
+
+
+@pytest.fixture
+def running_editor(tools, tmp_path):
+    with LocalServer(0, tmp_path, *tools) as editor:
+        worker = threading.Thread(target=editor.serve_forever)
+        worker.start()
+        try:
+            yield editor
+        finally:
+            editor.shutdown()
+            worker.join()
+
+
+def editor_request(editor, method, route, body=None):
+    with closing(http.client.HTTPConnection("127.0.0.1", editor.server_port, timeout=30)) as connection:
+        connection.request(method, route, body, {"X-Video-Engine-Token": editor.token})
+        response = connection.getresponse()
+        return response.status, json.loads(response.read())
+
+
+def test_upload_survives_short_pause_and_cleans_up_after_idle_timeout(running_editor, monkeypatch):
+    editor = running_editor
+    monkeypatch.setattr(web, "REQUEST_TIMEOUT", 0.2)
+    monkeypatch.setattr(web, "UPLOAD_IDLE_TIMEOUT", 1.0)
+    status, reply = editor_request(editor, "POST", "/job")
+    assert status == 201
+    folder = editor.folder / reply["job"]
+    route = f"/job/{reply['job']}/clip5"
+    payload = b"video bytes" * 160_000
+
+    for resume in (False, True):
+        with closing(http.client.HTTPConnection("127.0.0.1", editor.server_port, timeout=5)) as connection:
+            connection.putrequest("PUT", route)
+            connection.putheader("X-Video-Engine-Token", editor.token)
+            connection.putheader("Content-Length", str(len(payload)))
+            connection.endheaders(payload[:1024**2])
+            if resume:
+                assert not select.select([connection.sock], [], [], 0.35)[0]
+                connection.send(payload[1024**2:])
+            response = connection.getresponse()
+            reply = json.loads(response.read())
+            if resume:
+                assert response.status == 200 and reply == {"ok": True}
+                assert (folder / "clip5").read_bytes() == payload
+            else:
+                assert response.status == 408
+                assert reply["error"].startswith("Clip 5 upload: No data arrived")
+                assert not (folder / "clip5").exists()
+            assert not (folder / "clip5.partial").exists()
+
+
+@pytest.mark.parametrize(("option", "stage", "limit"), [("-show_streams", "Probing", 45), ("-progress", "Decoding", 180)])
+def test_source_timeout_reports_clip_and_processing_stage(clips, running_editor, monkeypatch, option, stage, limit):
+    editor = running_editor
+    status, reply = editor_request(editor, "POST", "/job")
+    assert status == 201
+    job = f"/job/{reply['job']}"
+    for name, clip in zip(CLIPS, clips):
+        assert editor_request(editor, "PUT", f"{job}/{name}", clip.read_bytes())[0] == 200
+
+    entered, release = threading.Event(), threading.Event()
+    run_command = subprocess.run
+
+    def intercept(args, **kwargs):
+        if option in args and any(isinstance(item, Path) and item.name == "clip5" for item in args):
+            assert kwargs["timeout"] == limit
+            entered.set()
+            assert release.wait(10)
+            raise subprocess.TimeoutExpired(args, limit)
+        return run_command(args, **kwargs)
+
+    monkeypatch.setattr(media.subprocess, "run", intercept)
+    with ThreadPoolExecutor() as executor:
+        render_request = executor.submit(editor_request, editor, "POST", f"{job}/render", b"{}")
+        try:
+            assert entered.wait(10)
+            assert editor_request(editor, "GET", f"{job}/status") == (200, {"progress": f"{stage} clip 5 of 5"})
+        finally:
+            release.set()
+        status, reply = render_request.result()
+    assert status == 422
+    assert reply["error"].startswith(f"{stage} clip 5 of 5 failed:")
+    assert f"exceeded the {limit}-second time limit" in reply["error"]
+    assert editor_request(editor, "GET", f"{job}/status") == (200, {"progress": None})
 
 
 @pytest.mark.parametrize("audio", ["keep", "mute"])
