@@ -208,3 +208,11 @@ def test_rejects_invalid_and_hdr_without_export(tools, tmp_path):
         "-color_trc", "arib-std-b67", "-color_primaries", "bt2020", "-colorspace", "bt2020nc", hdr)
     with pytest.raises(EngineError, match="unsupported color profile"):
         inspect_source(hdr, ffprobe)
+
+
+def test_matroska_longer_audio_does_not_extend_video(tools, tmp_path):
+    ffmpeg, ffprobe = tools
+    path = tmp_path / "audio-tail.mkv"
+    run(ffmpeg, "-f", "lavfi", "-i", "color=s=96x96:r=30:d=5", "-f", "lavfi", "-i", "sine=d=8",
+        "-c:v", "libx264", "-threads:v", "2", "-c:a", "aac", path)
+    assert inspect_source(path, ffprobe).frames == 150

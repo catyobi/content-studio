@@ -46,6 +46,24 @@ def fraction(value, fallback=None):
         return fallback
 
 
+def packet_duration(path, video, fps, ffprobe):
+    clock = fraction(video.get("time_base"))
+    if not clock or clock <= 0:
+        return None
+    packets = probe(path, "-select_streams", str(video["index"]), "-show_packets",
+                    "-show_entries", "packet=pts,duration", ffprobe=ffprobe).get("packets", [])
+    spans = []
+    for packet in packets:
+        pts = fraction(packet.get("pts"))
+        if pts is not None:
+            duration = fraction(packet.get("duration"), 0) * clock
+            start = pts * clock
+            spans.append((start, start + (duration if duration > 0 else 1 / fps)))
+    if spans:
+        return max(end for _, end in spans) - min(start for start, _ in spans)
+    return None
+
+
 @dataclass(frozen=True)
 class Source:
     path: Path
@@ -84,11 +102,8 @@ def inspect_source(path, ffprobe="ffprobe"):
     container = info.get("format", {})
     if not set(container.get("format_name", "").split(",")) & {"mov", "mp4", "matroska", "webm"}:
         raise EngineError(f"{path.name}: expected a MOV, MP4, MKV or WebM container.")
-    duration = fraction(video.get("duration"), fraction(container.get("duration")))
     fps = fraction(video.get("avg_frame_rate")) or fraction(video.get("r_frame_rate"))
     width, height = video["width"], video["height"]
-    if not duration or not 0 < duration <= MAX_SECONDS or not fps or not 0 < fps <= 60:
-        raise EngineError(f"{path.name}: expected a known duration of 0–180 seconds and up to 60 fps.")
     if min(width, height) < 16 or max(width, height) > 3840 or width * height > 3840 * 2160:
         raise EngineError(f"{path.name}: dimensions exceed the supported 4K pixel budget (or are below 16 × 16).")
     rotation = next((item["rotation"] for item in video.get("side_data_list", []) if "rotation" in item), 0) % 360
@@ -99,6 +114,14 @@ def inspect_source(path, ffprobe="ffprobe"):
     if (primaries not in (*UNKNOWN, "bt709") or transfer not in (*UNKNOWN, "bt709")
             or space not in (*UNKNOWN, *matrices)):
         raise EngineError(f"{path.name}: unsupported color profile ({primaries}/{transfer}/{space}); use SDR BT.709 footage.")
+    duration = fraction(video.get("duration"))
+    if not duration and fps and 0 < fps <= 60:
+        try:
+            duration = packet_duration(path, video, fps, ffprobe)
+        except EngineError as exc:
+            raise EngineError(f"{path.name}: cannot measure video duration ({exc}).") from exc
+    if not duration or not 0 < duration <= MAX_SECONDS or not fps or not 0 < fps <= 60:
+        raise EngineError(f"{path.name}: expected a known duration of 0–180 seconds and up to 60 fps.")
     color_range = video.get("color_range")
     full = color_range == "pc" or video.get("pix_fmt", "").startswith("yuvj")
     warning = f"{path.name}: untagged color fields were assumed to be SDR BT.709 video." if any(
