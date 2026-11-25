@@ -230,6 +230,19 @@ def test_exact_video_ticks_preserve_minimum_edit_length(tools, tmp_path):
     assert layout(spec)[1] == 750
 
 
+def test_packet_timebase_rounds_to_nearest_edit_frame(tools, tmp_path):
+    ffmpeg, ffprobe = tools
+    paths = []
+    for fps, suffix, codec in ((24, "mkv", "libx264"), (60, "mkv", "libx264"),
+                               (24, "webm", "libvpx-vp9"), (60, "webm", "libvpx-vp9"), (30, "mp4", "libx264")):
+        path = tmp_path / f"clip-{fps}.{suffix}"
+        run(ffmpeg, "-f", "lavfi", "-i", f"color=s=96x96:r={fps}:d=5", "-c:v", codec, "-threads:v", "2", path)
+        paths.append(path)
+    assert [inspect_source(path, ffprobe).frames for path in paths] == [150] * 5
+    spec = autoedit(paths, root=tmp_path, ffprobe=ffprobe)
+    assert layout(spec)[1] == 750
+
+
 def test_cut_after_one_frame_opener_preserves_timeline(clips, tools, tmp_path):
     ffmpeg, ffprobe = tools
     spec = autoedit(clips, root=tmp_path, ffprobe=ffprobe, transition="cut", audio="mute")

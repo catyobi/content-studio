@@ -81,7 +81,7 @@ class Source:
 
     @property
     def frames(self):
-        return int(self.duration * FPS)
+        return int(self.duration * FPS + Fraction(1, 2))
 
     @property
     def portrait(self):
