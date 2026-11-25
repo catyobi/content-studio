@@ -241,3 +241,16 @@ def test_cut_after_one_frame_opener_preserves_timeline(clips, tools, tmp_path):
     assert report["joins"][0]["startFrame"] == 1
     samples = pixels(ffmpeg, output, 700, 964)
     assert not identity_errors(samples, [1, 0, 2, 3, 4], layout(spec)[0], spec["transitions"])
+
+
+def test_opener_uses_rotated_display_aspect_ratio(clips, tools, tmp_path):
+    ffmpeg, ffprobe = tools
+    path = tmp_path / "anamorphic.mp4"
+    run(ffmpeg, "-f", "lavfi", "-i", "color=s=192x108:r=30:d=3", "-vf", "setsar=1/3",
+        "-c:v", "libx264", "-threads:v", "2", path)
+    rotated = tmp_path / "rotated.mp4"
+    run(ffmpeg, "-display_rotation:v:0", "90", "-i", path, "-c", "copy", rotated)
+    assert inspect_source(path, ffprobe).portrait
+    assert not inspect_source(rotated, ffprobe).portrait
+    spec = autoedit([clips[0], path, *clips[2:]], root=tmp_path, ffprobe=ffprobe)
+    assert spec["clips"][0]["path"] == path.name

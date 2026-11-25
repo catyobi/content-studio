@@ -77,6 +77,7 @@ class Source:
     matrix: str
     range: str
     warning: str | None = None
+    sar: Fraction = Fraction(1)
 
     @property
     def frames(self):
@@ -84,7 +85,8 @@ class Source:
 
     @property
     def portrait(self):
-        return self.width > self.height if self.rotation in (90, 270) else self.height > self.width
+        display_width = self.width * self.sar
+        return display_width > self.height if self.rotation in (90, 270) else self.height > display_width
 
 
 def inspect_source(path, ffprobe="ffprobe"):
@@ -129,5 +131,6 @@ def inspect_source(path, ffprobe="ffprobe"):
         value in UNKNOWN for value in (primaries, transfer, space, color_range)
     ) else None
     start = fraction(video.get("start_time"), fraction(container.get("start_time"), Fraction(0)))
+    sar = fraction((video.get("sample_aspect_ratio") or "").replace(":", "/"), Fraction(1))
     return Source(path, video["index"], audio, width, height, rotation, duration, start,
-                  matrices.get(space, "bt709"), "pc" if full else "tv", warning)
+                  matrices.get(space, "bt709"), "pc" if full else "tv", warning, sar=sar if sar > 0 else Fraction(1))
