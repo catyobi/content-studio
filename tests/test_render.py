@@ -4,6 +4,7 @@ import os
 import statistics
 import threading
 from array import array
+from fractions import Fraction
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -125,13 +126,13 @@ def test_default_title_rasterizes_unicode_glyphs():
 
 def test_dissolves_audio_rotation_and_originals(clips, tools, tmp_path):
     ffmpeg, ffprobe = tools
-    assert inspect_source(clips[1], ffprobe).portrait
-    assert inspect_source(clips[2], ffprobe).audio is None
+    assert inspect_source(clips[1], ffprobe, ffmpeg=ffmpeg).portrait
+    assert inspect_source(clips[2], ffprobe, ffmpeg=ffmpeg).audio is None
     before = checksums(clips)
     brand = {"text": "Five clips: café & craft", "backgroundColor": "#24364A", "textColor": "#F9C74F",
              "logo": {"path": str(clips[0].parent / "logo.png"), "position": "top-right", "width": 160}}
-    spec = autoedit([str(p) for p in clips], root=tmp_path, ffprobe=ffprobe, branding=brand)
-    assert spec == autoedit([str(p) for p in clips], root=tmp_path, ffprobe=ffprobe, branding=brand)
+    spec = autoedit([str(p) for p in clips], root=tmp_path, ffmpeg=ffmpeg, ffprobe=ffprobe, branding=brand)
+    assert spec == autoedit([str(p) for p in clips], root=tmp_path, ffmpeg=ffmpeg, ffprobe=ffprobe, branding=brand)
     assert len(spec["transitions"]) == 4 and all(t["frames"] == 18 for t in spec["transitions"])
     output = tmp_path / "kept.mp4"
     report = render(spec, output, root=tmp_path, ffmpeg=ffmpeg, ffprobe=ffprobe)
@@ -202,12 +203,12 @@ def test_rejects_invalid_and_hdr_without_export(tools, tmp_path):
     corrupt = tmp_path / "bad.mp4"
     corrupt.write_bytes(b"not video")
     with pytest.raises(EngineError, match="cannot read source"):
-        inspect_source(corrupt, ffprobe)
+        inspect_source(corrupt, ffprobe, ffmpeg=ffmpeg)
     hdr = tmp_path / "hdr.mp4"
     run(ffmpeg, "-f", "lavfi", "-i", "color=green:s=96x96:d=1", "-c:v", "libx264", "-threads", "2",
         "-color_trc", "arib-std-b67", "-color_primaries", "bt2020", "-colorspace", "bt2020nc", hdr)
     with pytest.raises(EngineError, match="unsupported color profile"):
-        inspect_source(hdr, ffprobe)
+        inspect_source(hdr, ffprobe, ffmpeg=ffmpeg)
 
 
 def test_matroska_longer_audio_does_not_extend_video(tools, tmp_path):
@@ -215,7 +216,7 @@ def test_matroska_longer_audio_does_not_extend_video(tools, tmp_path):
     path = tmp_path / "audio-tail.mkv"
     run(ffmpeg, "-f", "lavfi", "-i", "color=s=96x96:r=30:d=5", "-f", "lavfi", "-i", "sine=d=8",
         "-c:v", "libx264", "-threads:v", "2", "-c:a", "aac", path)
-    assert inspect_source(path, ffprobe).frames == 150
+    assert inspect_source(path, ffprobe, ffmpeg=ffmpeg).frames == 150
 
 
 def test_exact_video_ticks_preserve_minimum_edit_length(tools, tmp_path):
@@ -225,12 +226,12 @@ def test_exact_video_ticks_preserve_minimum_edit_length(tools, tmp_path):
     for path, count in zip(paths, counts):
         run(ffmpeg, "-f", "lavfi", "-i", "color=s=96x96:r=30", "-frames:v", str(count),
             "-c:v", "libx264", "-threads:v", "2", path)
-    spec = autoedit(paths, root=tmp_path, ffprobe=ffprobe)
+    spec = autoedit(paths, root=tmp_path, ffmpeg=ffmpeg, ffprobe=ffprobe)
     assert lengths(spec) == counts
     assert layout(spec)[1] == 750
 
 
-def test_packet_timebase_rounds_to_nearest_edit_frame(tools, tmp_path):
+def test_short_mkv_and_webm_supply_150_edit_frames(tools, tmp_path):
     ffmpeg, ffprobe = tools
     paths = []
     for fps, suffix, codec in ((24, "mkv", "libx264"), (60, "mkv", "libx264"),
@@ -238,14 +239,26 @@ def test_packet_timebase_rounds_to_nearest_edit_frame(tools, tmp_path):
         path = tmp_path / f"clip-{fps}.{suffix}"
         run(ffmpeg, "-f", "lavfi", "-i", f"color=s=96x96:r={fps}:d=5", "-c:v", codec, "-threads:v", "2", path)
         paths.append(path)
-    assert [inspect_source(path, ffprobe).frames for path in paths] == [150] * 5
-    spec = autoedit(paths, root=tmp_path, ffprobe=ffprobe)
+    assert [inspect_source(path, ffprobe, ffmpeg=ffmpeg).frames for path in paths] == [150] * 5
+    spec = autoedit(paths, root=tmp_path, ffmpeg=ffmpeg, ffprobe=ffprobe)
     assert layout(spec)[1] == 750
+
+
+def test_stream_copy_edit_list_does_not_overcount(tools, tmp_path):
+    ffmpeg, ffprobe = tools
+    original, trimmed = (tmp_path / name for name in ("original.mp4", "trimmed.mp4"))
+    run(ffmpeg, "-f", "lavfi", "-i", "testsrc2=s=96x96:r=24:d=8", "-c:v", "libx264",
+        "-threads:v", "2", "-g", "48", original)
+    run(ffmpeg, "-ss", "0.26", "-i", original, "-t", "5", "-c", "copy", "-use_editlist", "1", trimmed)
+    assert b"elst" in trimmed.read_bytes()
+    source = inspect_source(trimmed, ffprobe, ffmpeg=ffmpeg)
+    assert source.frames == 156
+    assert source.duration == Fraction(26, 5)
 
 
 def test_cut_after_one_frame_opener_preserves_timeline(clips, tools, tmp_path):
     ffmpeg, ffprobe = tools
-    spec = autoedit(clips, root=tmp_path, ffprobe=ffprobe, transition="cut", audio="mute")
+    spec = autoedit(clips, root=tmp_path, ffmpeg=ffmpeg, ffprobe=ffprobe, transition="cut", audio="mute")
     for clip, count in zip(spec["clips"], (1, 188, 188, 188, 188)):
         clip.update(inFrame=0, outFrame=count)
     output = tmp_path / "one-frame-opener.mp4"
@@ -263,9 +276,9 @@ def test_opener_uses_rotated_display_aspect_ratio(clips, tools, tmp_path):
         "-c:v", "libx264", "-threads:v", "2", path)
     rotated = tmp_path / "rotated.mp4"
     run(ffmpeg, "-display_rotation:v:0", "90", "-i", path, "-c", "copy", rotated)
-    assert inspect_source(path, ffprobe).portrait
-    assert not inspect_source(rotated, ffprobe).portrait
-    spec = autoedit([clips[0], path, *clips[2:]], root=tmp_path, ffprobe=ffprobe)
+    assert inspect_source(path, ffprobe, ffmpeg=ffmpeg).portrait
+    assert not inspect_source(rotated, ffprobe, ffmpeg=ffmpeg).portrait
+    spec = autoedit([clips[0], path, *clips[2:]], root=tmp_path, ffmpeg=ffmpeg, ffprobe=ffprobe)
     assert spec["clips"][0]["path"] == path.name
 
 

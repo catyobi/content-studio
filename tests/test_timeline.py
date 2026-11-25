@@ -14,7 +14,7 @@ from video_engine.verify import top_level_boxes
 
 def sources(seconds, root):
     return [Source(root / f"{i}.mp4", 0, None if i == 2 else 1, 1920, 1080, 90 if i == 1 else 0,
-                   Fraction(n), Fraction(0), "bt709", "tv") for i, n in enumerate(seconds)]
+                   30 * n, Fraction(0), "bt709", "tv") for i, n in enumerate(seconds)]
 
 
 def test_planner_opener_budget_and_replay(tmp_path):

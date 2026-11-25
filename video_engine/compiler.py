@@ -1,3 +1,4 @@
+from .media import NORMALIZE_CLOCK
 from .timeline import FPS, layout, lengths
 
 SAMPLE_RATE = 48000
@@ -25,7 +26,7 @@ def build_graph(spec, sources, overlays):
     for i, (clip, source) in enumerate(zip(spec["clips"], sources)):
         start, end = clip["inFrame"], clip["outFrame"]
         fit = framing(clip["fit"], source.matrix, source.range, spec["branding"]["backgroundColor"])
-        graph.append(f"[{i}:{source.video}]setpts=PTS-STARTPTS,fps={FPS},"
+        graph.append(f"[{i}:{source.video}]{NORMALIZE_CLOCK},"
                      f"trim=start_frame={start}:end_frame={end},setpts=PTS-STARTPTS,fps={FPS},settb=1/{FPS},"
                      f"{fit},setsar=1,{COLOR},showinfo@clip{i}=checksum=0[v{i}]")
         if keep and source.audio is None:

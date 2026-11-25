@@ -48,7 +48,7 @@ def main(argv=None):
             if options.font:
                 brand["fontFile"] = os.path.relpath(asset_path(Path.cwd(), options.font), root)
             spec = autoedit(options.clips, root=root, transition=options.transition, fit=options.fit,
-                            audio=options.audio, branding=brand, ffprobe=ffprobe)
+                            audio=options.audio, branding=brand, ffmpeg=ffmpeg, ffprobe=ffprobe)
             with options.output.open("x", encoding="utf-8") as handle:
                 handle.write(json.dumps(spec, indent=2) + "\n")
             print(options.output)

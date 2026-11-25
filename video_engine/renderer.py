@@ -18,7 +18,7 @@ def render(spec, output, *, root, ffmpeg="ffmpeg", ffprobe="ffprobe"):
         raise EngineError("Specify an .mp4 path in an existing output directory.")
     if target.exists() or target.is_symlink():
         raise EngineError("Output already exists; choose a new filename. Sources are never overwritten.")
-    sources = [inspect_source(asset_path(root, item["path"]), ffprobe) for item in spec["clips"]]
+    sources = [inspect_source(asset_path(root, item["path"]), ffprobe, ffmpeg=ffmpeg) for item in spec["clips"]]
     for i, (clip, source) in enumerate(zip(spec["clips"], sources), 1):
         if clip["outFrame"] > source.frames:
             raise EngineError(f"Clip {i} trim exceeds available media ({source.frames} normalized frames).")

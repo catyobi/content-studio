@@ -145,7 +145,7 @@ class Handler(BaseHTTPRequestHandler):
                                     "width": settings.get("logoWidth", 168)}
             if (job / "font").exists():
                 branding["fontFile"] = "font"
-            spec = autoedit([str(job / clip) for clip in CLIPS], root=job, ffprobe=self.server.ffprobe,
+            spec = autoedit([str(job / clip) for clip in CLIPS], root=job, ffmpeg=self.server.ffmpeg, ffprobe=self.server.ffprobe,
                             transition=settings.get("transition", "dissolve"), fit=settings.get("fit", "contain"),
                             audio=settings.get("audio", "keep"), branding=branding)
             report = render(spec, job / "export.mp4", root=job, ffmpeg=self.server.ffmpeg, ffprobe=self.server.ffprobe)

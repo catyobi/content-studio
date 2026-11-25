@@ -29,6 +29,7 @@ The interface is bound to IPv4 loopback and handles one active browser job. It i
 
 - Moves the first portrait clip with at least three seconds of footage to the start (respecting rotation metadata); leaves the other clips in selection order. If none qualify, leaves the original order.
 - Aims for 27 seconds. Distributes time as evenly as available footage permits and center-trims each clip, dropping equal amounts from its head and tail where possible. It does not score scene quality or recognize speech.
+- Counts each selected video stream's decodable frames at the 30 fps edit clock before choosing trims. This scan takes longer than reading container metadata, but avoids planning trims against audio tails or video frames hidden by edit lists.
 - Uses 0.6-second dissolves when selected and feasible. It shortens overlaps or switches to cuts when footage is short. Five clips with less than 25 seconds of usable footage cannot render; no frames are invented or clips looped to hit the target.
 - Fits the entire frame by default with the brand padding color. Center crop is optional. Keep mode preserves the first audio track from each clip, aligns it to the edit and crossfades where video dissolves; clips without audio use silence. Mute mode omits the audio stream.
 

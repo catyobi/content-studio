@@ -10,6 +10,7 @@ from .timeline import FPS, EngineError
 MAX_BYTES = 1024**3
 MAX_SECONDS = 180
 UNKNOWN = (None, "unknown", "unspecified", "reserved")
+NORMALIZE_CLOCK = f"setpts=PTS-STARTPTS,fps={FPS}"
 
 
 def command(args, *, timeout=45, capture=True, **kwargs):
@@ -46,22 +47,14 @@ def fraction(value, fallback=None):
         return fallback
 
 
-def packet_duration(path, video, fps, ffprobe):
-    clock = fraction(video.get("time_base"))
-    if not clock or clock <= 0:
-        return None
-    packets = probe(path, "-select_streams", str(video["index"]), "-show_packets",
-                    "-show_entries", "packet=pts,duration", ffprobe=ffprobe).get("packets", [])
-    spans = []
-    for packet in packets:
-        pts = fraction(packet.get("pts"))
-        if pts is not None:
-            duration = fraction(packet.get("duration"), 0) * clock
-            start = pts * clock
-            spans.append((start, start + (duration if duration > 0 else 1 / fps)))
-    if spans:
-        return max(end for _, end in spans) - min(start for start, _ in spans)
-    return None
+def decoded_frame_count(path, stream, ffmpeg):
+    result = command([ffmpeg, "-hide_banner", "-nostdin", "-nostats", "-v", "error", "-copyts",
+                      "-progress", "pipe:1", "-threads", "2", "-protocol_whitelist", "file", "-i", path,
+                      "-map", f"0:{stream}", "-filter_threads", "2", "-vf", NORMALIZE_CLOCK,
+                      "-fps_mode", "passthrough", "-frames:v", str(MAX_SECONDS * FPS + 1), "-f", "null", "-"],
+                     timeout=180)
+    counts = re.findall(rb"^frame= *([0-9]+)$", result.stdout, re.MULTILINE)
+    return int(counts[-1]) if counts else 0
 
 
 @dataclass(frozen=True)
@@ -72,7 +65,7 @@ class Source:
     width: int
     height: int
     rotation: int
-    duration: Fraction
+    frames: int
     start: Fraction
     matrix: str
     range: str
@@ -80,8 +73,8 @@ class Source:
     sar: Fraction = Fraction(1)
 
     @property
-    def frames(self):
-        return int(self.duration * FPS + Fraction(1, 2))
+    def duration(self):
+        return Fraction(self.frames, FPS)
 
     @property
     def portrait(self):
@@ -89,7 +82,7 @@ class Source:
         return display_width > self.height if self.rotation in (90, 270) else self.height > display_width
 
 
-def inspect_source(path, ffprobe="ffprobe"):
+def inspect_source(path, ffprobe="ffprobe", *, ffmpeg="ffmpeg"):
     if path.stat().st_size > MAX_BYTES:
         raise EngineError(f"{path.name}: source exceeds 1 GiB.")
     try:
@@ -105,6 +98,8 @@ def inspect_source(path, ffprobe="ffprobe"):
     if not set(container.get("format_name", "").split(",")) & {"mov", "mp4", "matroska", "webm"}:
         raise EngineError(f"{path.name}: expected a MOV, MP4, MKV or WebM container.")
     fps = fraction(video.get("avg_frame_rate")) or fraction(video.get("r_frame_rate"))
+    if not fps or not 0 < fps <= 60:
+        raise EngineError(f"{path.name}: expected a video frame rate of up to 60 fps.")
     width, height = video["width"], video["height"]
     if min(width, height) < 16 or max(width, height) > 3840 or width * height > 3840 * 2160:
         raise EngineError(f"{path.name}: dimensions exceed the supported 4K pixel budget (or are below 16 × 16).")
@@ -116,15 +111,12 @@ def inspect_source(path, ffprobe="ffprobe"):
     if (primaries not in (*UNKNOWN, "bt709") or transfer not in (*UNKNOWN, "bt709")
             or space not in (*UNKNOWN, *matrices)):
         raise EngineError(f"{path.name}: unsupported color profile ({primaries}/{transfer}/{space}); use SDR BT.709 footage.")
-    ticks = fraction(video.get("duration_ts"), 0)
-    duration = ticks * fraction(video.get("time_base"), 0)
-    if not duration and fps and 0 < fps <= 60:
-        try:
-            duration = packet_duration(path, video, fps, ffprobe)
-        except EngineError as exc:
-            raise EngineError(f"{path.name}: cannot measure video duration ({exc}).") from exc
-    if not duration or not 0 < duration <= MAX_SECONDS or not fps or not 0 < fps <= 60:
-        raise EngineError(f"{path.name}: expected a known duration of 0–180 seconds and up to 60 fps.")
+    try:
+        frames = decoded_frame_count(path, video["index"], ffmpeg)
+    except EngineError as exc:
+        raise EngineError(f"{path.name}: cannot count video frames ({exc}).") from exc
+    if not 0 < frames <= MAX_SECONDS * FPS:
+        raise EngineError(f"{path.name}: expected decodable video of no more than {MAX_SECONDS} seconds.")
     color_range = video.get("color_range")
     full = color_range == "pc" or video.get("pix_fmt", "").startswith("yuvj")
     warning = f"{path.name}: untagged color fields were assumed to be SDR BT.709 video." if any(
@@ -132,5 +124,5 @@ def inspect_source(path, ffprobe="ffprobe"):
     ) else None
     start = fraction(video.get("start_time"), fraction(container.get("start_time"), Fraction(0)))
     sar = fraction((video.get("sample_aspect_ratio") or "").replace(":", "/"), Fraction(1))
-    return Source(path, video["index"], audio, width, height, rotation, duration, start,
+    return Source(path, video["index"], audio, width, height, rotation, frames, start,
                   matrices.get(space, "bt709"), "pc" if full else "tv", warning, sar=sar if sar > 0 else Fraction(1))
