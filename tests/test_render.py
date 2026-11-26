@@ -8,6 +8,7 @@ import struct
 import subprocess
 import threading
 from array import array
+from colorsys import rgb_to_hsv
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from fractions import Fraction
@@ -414,8 +415,10 @@ def test_renders_mixed_sdr_hlg_and_hdr10_with_matching_colors(tools, tmp_path):
               (186, 124, 98), (186, 67, 57), (53, 176, 76), (63, 97, 185), (30, 30, 30)]
     patches = [tuple((value / 255) ** 2.4 for value in color) for color in colors]
     patches[3:5] = [(1.2, 1.2, 1.2), (8.0, 8.0, 8.0)]
+    wide_colors = [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 1.0, 1.0)]
+    patches.extend([*wide_colors, patches[9], patches[9]])
     pattern = tmp_path / "patches.rgb"
-    samples = [patches[5 * (y // 48) + x // 36][channel]
+    samples = [patches[5 * (y // 32) + x // 36][channel]
                for channel in (1, 2, 0) for y in range(96) for x in range(180)]
     pattern.write_bytes(struct.pack(f"<{len(samples)}f", *samples))
 
@@ -435,10 +438,16 @@ def test_renders_mixed_sdr_hlg_and_hdr10_with_matching_colors(tools, tmp_path):
         if odd:
             encoder, compression = "libvpx-vp9", ["-profile:v", "2", "-lossless", "1"]
             crop = ",crop=179:95:exact=1"
+        convert = f"tin=linear:min=gbr:rin=full:p={primaries}:t={transfer}:m={matrix}:r=limited:npl=100"
+        graph = f"zscale=pin=bt709:{convert},format={pixel_format}"
+        if hdr:
+            graph = (f"split[base][wide];[base]crop=180:64:0:0,{graph}[base709];"
+                     f"[wide]crop=180:32:0:64,zscale=pin=bt2020:{convert},format={pixel_format}[wide2020];"
+                     f"[base709][wide2020]vstack{crop},setparams=range=limited:"
+                     f"color_primaries={primaries}:color_trc={transfer}:colorspace={matrix}")
         run(ffmpeg, "-stream_loop", "-1", "-f", "rawvideo", "-pixel_format", "gbrpf32le", "-video_size", "180x96",
-            "-framerate", "30", "-i", pattern, "-t", "6", "-filter_threads", "1", "-vf",
-            f"zscale=pin=bt709:tin=linear:min=gbr:rin=full:p={primaries}:t={transfer}:m={matrix}:r=limited:npl=100,"
-            f"format={pixel_format}{crop}", "-c:v", encoder, "-threads", "2",
+            "-framerate", "30", "-i", pattern, "-t", "6", "-filter_complex_threads", "1", "-filter_complex", graph,
+            "-c:v", encoder, "-threads", "2",
             "-color_primaries", primaries, "-color_trc", transfer, "-colorspace", matrix, "-color_range", "tv",
             *compression, path)
     for copy in paths[4:]:
@@ -460,16 +469,22 @@ def test_renders_mixed_sdr_hlg_and_hdr10_with_matching_colors(tools, tmp_path):
 
     starts, _ = layout(spec)
     select_frames = "+".join(f"eq(n,{start + 60})" for start in starts[:4])
-    raw = run(ffmpeg, "-threads", "2", "-i", output, "-an", "-vf",
-              f"select='{select_frames}',scale=in_color_matrix=bt709,format=rgb24",
-              "-fps_mode", "passthrough", "-threads", "1", "-f", "rawvideo", "-")
+    yuv = run(ffmpeg, "-threads", "2", "-i", output, "-an", "-vf", f"select='{select_frames}'",
+              "-frames:v", "4", "-fps_mode", "passthrough", "-threads", "1", "-f", "rawvideo", "-")
+    yuv_frames = tmp_path / "export.yuv"
+    yuv_frames.write_bytes(yuv)
+    raw = run(ffmpeg, "-f", "rawvideo", "-pixel_format", "yuv420p", "-video_size", "1080x1920", "-i", yuv_frames,
+              "-vf", "scale=in_color_matrix=bt709:in_range=tv,format=rgb24", "-threads", "1", "-f", "rawvideo", "-")
     frame_bytes = 1080 * 1920 * 3
     assert len(raw) == 4 * frame_bytes
-    observed = []
-    for offset in range(0, len(raw), frame_bytes):
-        frame = Image.frombytes("RGB", (1080, 1920), raw[offset:offset + frame_bytes])
-        anchors = [(104 + 216 * (i % 5), 812 + 288 * (i // 5)) for i in range(len(colors))]
-        observed.append([tuple(ImageStat.Stat(frame.crop((x, y, x + 8, y + 8))).mean) for x, y in anchors])
+    frames = [Image.frombytes("RGB", (1080, 1920), raw[offset:offset + frame_bytes])
+              for offset in range(0, len(raw), frame_bytes)]
+
+    def sample(frame, x, y, size=8):
+        return tuple(ImageStat.Stat(frame.crop((x, y, x + size, y + size))).mean)
+
+    anchors = [(104 + 216 * (i % 5), 764 + 192 * (i // 5)) for i in range(len(colors))]
+    observed = [[sample(frame, x, y) for x, y in anchors] for frame in frames]
     print(f"Color patches SDR/HLG/PQ/odd HLG: {observed}; mixed render: {report['renderSeconds']}s")
     for actual in observed:
         for i, rgb in enumerate(actual):
@@ -481,6 +496,34 @@ def test_renders_mixed_sdr_hlg_and_hdr10_with_matching_colors(tools, tmp_path):
         assert min(actual[4]) - max(actual[3]) >= 4
         for tone_mapped, sdr in zip(actual, observed[0]):
             assert tone_mapped == pytest.approx(sdr, abs=12)
+
+    luma_bytes = 1080 * 1920
+    chroma_bytes = luma_bytes // 4
+    for i, frame in enumerate(frames[1:], 1):
+        start = i * (luma_bytes + 2 * chroma_bytes)
+        y_plane = Image.frombytes("L", (1080, 1920), yuv[start:start + luma_bytes])
+        u_start = start + luma_bytes
+        v_start = u_start + chroma_bytes
+        chroma_planes = [Image.frombytes("L", (540, 960), yuv[o:o + chroma_bytes]) for o in (u_start, v_start)]
+        for j, expected_hue in enumerate((0, 120, 180)):
+            x, y = 104 + 216 * j, 1148
+            rgb = sample(frame, x, y)
+            hue, saturation, value = rgb_to_hsv(*(channel / 255 for channel in rgb))
+            hue_error = abs((360 * hue - expected_hue + 180) % 360 - 180)
+            assert hue_error <= 10, (i, j, rgb, hue_error)
+            assert saturation >= 0.6 and value >= 0.5, (i, j, rgb)
+            lo, hi = y_plane.crop((x, y, x + 8, y + 8)).getextrema()
+            assert 16 <= lo <= hi <= 235
+            for plane in chroma_planes:
+                lo, hi = plane.crop((x // 2, y // 2, x // 2 + 4, y // 2 + 4)).getextrema()
+                assert 16 <= lo <= hi <= 240
+            print(f"Wide-gamut patch {i}/{j}: {rgb}; hue error {hue_error:.1f}°")
+
+    for offset in (-12, 12):
+        even = sample(frames[1], 216 + offset, 1148, size=2)
+        odd = sample(frames[3], round(36 * 1080 / 179) + offset, 1148, size=2)
+        print(f"Chroma edge {offset:+}: even {even}, odd {odd}")
+        assert odd == pytest.approx(even, abs=16)
 
 
 def test_reports_missing_hdr_filters(monkeypatch):
