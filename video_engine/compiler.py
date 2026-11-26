@@ -5,14 +5,29 @@ SAMPLE_RATE = 48000
 SAMPLES_PER_FRAME = SAMPLE_RATE // FPS
 COLOR = "setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709"
 SDR_PEAK_NITS = 100
+PLANAR_420 = {"yuvj420p", "yuv420p", *(f"yuv420p{depth}le" for depth in (9, 10, 12, 14, 16))}
+CHROMA_LOCATIONS = {"left", "center", "topleft", "top", "bottomleft", "bottom"}
 
 
-def tone_map(source):
+def tone_map(source, index):
     level = "full" if source.range == "pc" else "limited"
-    align_chroma = ("crop=w=trunc(iw/hsub)*hsub:h=trunc(ih/vsub)*vsub:x=0:y=0:keep_aspect=1,"
-                    if source.width % 2 or source.height % 2 else "")
-    return (f"{align_chroma}zscale=pin=bt2020:tin={source.hdr_transfer}:min=bt2020nc:rin={level}:t=linear:npl={SDR_PEAK_NITS},"
-            "format=gbrpf32le,setparams=colorspace=bt2020nc,"
+    prepare = restore = chroma_location = ""
+    if source.width % 2 or source.height % 2:
+        if source.pixel_format in PLANAR_420:
+            width, height = (source.height, source.width) if source.rotation in (90, 270) else (source.width, source.height)
+            chroma = source.chroma_location if source.chroma_location in CHROMA_LOCATIONS else "left"
+            # The chroma planes already cover the rounded-up dimensions.
+            prepare = (f"extractplanes=y+u+v[hy{index}][hu{index}][hv{index}];"
+                       f"[hy{index}]pad=ceil(iw/2)*2:ceil(ih/2)*2[hp{index}];"
+                       f"[hp{index}][hu{index}][hv{index}]mergeplanes=format={source.pixel_format}:map1s=1:map2s=2,"
+                       f"setparams=range={level}:color_primaries=bt2020:color_trc={source.hdr_transfer}:colorspace=bt2020nc,")
+            chroma_location = f":cin={chroma}"
+            restore = f"crop={width}:{height}:0:0:exact=1,"
+        else:
+            prepare = "format=yuv444p16le,"
+    return (f"{prepare}zscale=pin=bt2020:tin={source.hdr_transfer}:min=bt2020nc:rin={level}:"
+            f"t=linear:npl={SDR_PEAK_NITS}{chroma_location},"
+            f"format=gbrpf32le,{restore}setparams=colorspace=bt2020nc,"
             f"tonemap=mobius:param=0.75:desat=2:peak={source.hdr_peak_nits/SDR_PEAK_NITS:.8g},"
             "zscale=min=gbr:p=bt709:t=bt709:m=bt709:r=limited,format=yuv444p10le,"
             "sidedata=delete:type=MASTERING_DISPLAY_METADATA,sidedata=delete:type=CONTENT_LIGHT_LEVEL,"
@@ -38,7 +53,7 @@ def build_graph(spec, sources, overlays):
     starts, _ = layout(spec)
     for i, (clip, source) in enumerate(zip(spec["clips"], sources)):
         start, end = clip["inFrame"], clip["outFrame"]
-        hdr = tone_map(source) if source.hdr_transfer else ""
+        hdr = tone_map(source, i) if source.hdr_transfer else ""
         matrix, level = ("bt709", "tv") if hdr else (source.matrix, source.range)
         fit = framing(clip["fit"], matrix, level, spec["branding"]["backgroundColor"])
         graph.append(f"[{i}:{source.video}]{NORMALIZE_CLOCK},"

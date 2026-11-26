@@ -88,6 +88,8 @@ class Source:
     sar: Fraction = Fraction(1)
     hdr_transfer: str | None = None
     hdr_peak_nits: float | None = None
+    pixel_format: str | None = None
+    chroma_location: str | None = None
 
     @property
     def duration(self):
@@ -160,7 +162,8 @@ def inspect_source(path, ffprobe="ffprobe", *, ffmpeg="ffmpeg", source_cache=Non
     sar = fraction((video.get("sample_aspect_ratio") or "").replace(":", "/"), Fraction(1))
     source = Source(path, video["index"], audio, width, height, rotation, frames, start,
                     matrices.get(space, "bt709"), "pc" if full else "tv", warning, sar=sar if sar > 0 else Fraction(1),
-                    hdr_transfer=transfer if hdr else None, hdr_peak_nits=peak if hdr else None)
+                    hdr_transfer=transfer if hdr else None, hdr_peak_nits=peak if hdr else None,
+                    pixel_format=video.get("pix_fmt"), chroma_location=video.get("chroma_location"))
     if source_cache is not None:
         if source_signature(path.stat()) != signature:
             raise EngineError(f"{path.name}: source changed during inspection; try again.")

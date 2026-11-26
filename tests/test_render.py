@@ -22,6 +22,7 @@ from PIL import Image, ImageStat
 
 from video_engine import media, server as web
 from video_engine.branding import prepare_overlays, title_image
+from video_engine.compiler import tone_map
 from video_engine.media import command, inspect_source, require_tools
 from video_engine.planner import autoedit
 from video_engine.renderer import render, require_hdr_filters
@@ -418,7 +419,7 @@ def test_renders_mixed_sdr_hlg_and_hdr10_with_matching_colors(tools, tmp_path):
     wide_colors = [(1.0, 0.0, 0.0), (0.0, 1.0, 1.0), (0.0, 1.0, 0.0)]
     patches.extend([*wide_colors, patches[9], patches[9]])
     pattern = tmp_path / "patches.rgb"
-    samples = [patches[5 * (y // 32) + x // 36][channel]
+    samples = [1.2 if x == 178 or y == 94 else patches[5 * (y // 32) + x // 36][channel]
                for channel in (1, 2, 0) for y in range(96) for x in range(180)]
     pattern.write_bytes(struct.pack(f"<{len(samples)}f", *samples))
 
@@ -519,10 +520,27 @@ def test_renders_mixed_sdr_hlg_and_hdr10_with_matching_colors(tools, tmp_path):
                 assert 16 <= lo <= hi <= 240
             print(f"Wide-gamut patch {i}/{j}: {rgb}; hue error {hue_error:.1f}°")
 
-    edge_x = round(36 * 1080 / sources[1].width)
-    edge_y = 1148
+    edge_frames = []
+    for source in (sources[1], sources[3]):
+        raw = run(ffmpeg, "-i", source.path, "-filter_complex_threads", "1", "-filter_complex",
+                  f"{tone_map(source, 0)}scale=in_color_matrix=bt709:in_range=tv,format=rgb24",
+                  "-frames:v", "1", "-threads", "1", "-f", "rawvideo", "-")
+        dims = source.width, source.height
+        assert len(raw) == source.width * source.height * 3
+        edge_frames.append(Image.frombytes("RGB", dims, raw))
+
+    odd = edge_frames[1]
+    for border, inside in (((178, 48), (177, 48)), ((160, 94), (160, 93))):
+        assert min(odd.getpixel(border)) >= 235
+        assert max(odd.getpixel(inside)) <= 40
+    assert min(frames[3].getpixel((1077, 960))) >= 190
+    assert min(frames[3].getpixel((960, 1243))) >= 190
+
+    edge_frames = [frame.resize((frame.width * 6, frame.height * 6), Image.Resampling.BICUBIC)
+                   for frame in edge_frames]
+    edge_x, edge_y = 216, 480
     profiles = [list(frame.crop((edge_x - 8, edge_y, edge_x + 9, edge_y + 1)).getdata())
-                for frame in (frames[1], frames[3])]
+                for frame in edge_frames]
 
     def midpoint_crossing(values, left, right):
         midpoint = (left + right) / 2
@@ -532,7 +550,7 @@ def test_renders_mixed_sdr_hlg_and_hdr10_with_matching_colors(tools, tmp_path):
         return i - 1 + (midpoint - values[i - 1]) / (values[i] - values[i - 1])
 
     crossings = []
-    for frame, profile in zip((frames[1], frames[3]), profiles):
+    for frame, profile in zip(edge_frames, profiles):
         left, right = sample(frame, 104, edge_y), sample(frame, 320, edge_y)
         crossings.append([midpoint_crossing(channel, lo, hi) - 8
                           for channel, lo, hi in zip(zip(*profile), left, right)])
