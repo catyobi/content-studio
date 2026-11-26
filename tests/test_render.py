@@ -419,22 +419,29 @@ def test_renders_mixed_sdr_hlg_and_hdr10_with_matching_colors(tools, tmp_path):
                for channel in (1, 2, 0) for y in range(96) for x in range(180)]
     pattern.write_bytes(struct.pack(f"<{len(samples)}f", *samples))
 
-    paths = [tmp_path / name for name in ("sdr.mp4", "hlg.mov", "pq.mp4", "sdr2.mp4", "sdr3.mp4")]
-    for path, transfer in zip(paths[:3], ("bt709", "arib-std-b67", "smpte2084")):
+    paths = [tmp_path / name for name in ("sdr.mp4", "hlg.mov", "pq.mp4", "odd-hlg.webm", "sdr2.mp4")]
+    for path, transfer in zip(paths[:4], ("bt709", "arib-std-b67", "smpte2084", "arib-std-b67")):
         hdr = transfer != "bt709"
+        odd = path.suffix == ".webm"
         primaries, matrix = ("bt2020", "bt2020nc") if hdr else ("bt709", "bt709")
         pixel_format = "yuv420p10le" if hdr else "yuv420p"
         params = "pools=1:frame-threads=1:lossless=1"
         if transfer == "smpte2084":
             params += ":max-cll=800,300:master-display=G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,50)"
+        encoder = "libx265" if hdr else "libx264"
         compression = ["-x265-params", params, "-tag:v", "hvc1"] if hdr else ["-qp", "0"]
+        compression += ["-preset", "ultrafast"]
+        crop = ""
+        if odd:
+            encoder, compression = "libvpx-vp9", ["-profile:v", "2", "-lossless", "1"]
+            crop = ",crop=179:95:exact=1"
         run(ffmpeg, "-stream_loop", "-1", "-f", "rawvideo", "-pixel_format", "gbrpf32le", "-video_size", "180x96",
             "-framerate", "30", "-i", pattern, "-t", "6", "-filter_threads", "1", "-vf",
             f"zscale=pin=bt709:tin=linear:min=gbr:rin=full:p={primaries}:t={transfer}:m={matrix}:r=limited:npl=100,"
-            f"format={pixel_format}", "-c:v", "libx265" if hdr else "libx264", "-threads", "2", "-preset", "ultrafast",
+            f"format={pixel_format}{crop}", "-c:v", encoder, "-threads", "2",
             "-color_primaries", primaries, "-color_trc", transfer, "-colorspace", matrix, "-color_range", "tv",
             *compression, path)
-    for copy in paths[3:]:
+    for copy in paths[4:]:
         copy.write_bytes(paths[0].read_bytes())
     original = checksums(paths)
     source_cache = {}
@@ -443,6 +450,8 @@ def test_renders_mixed_sdr_hlg_and_hdr10_with_matching_colors(tools, tmp_path):
     assert sources[0].hdr_transfer is None
     assert (sources[1].hdr_transfer, sources[1].hdr_peak_nits) == ("arib-std-b67", 1000)
     assert (sources[2].hdr_transfer, sources[2].hdr_peak_nits) == ("smpte2084", 800)
+    assert (sources[3].hdr_transfer, sources[3].width, sources[3].height) == ("arib-std-b67", 179, 95)
+    assert media.probe(paths[3], "-show_streams", ffprobe=ffprobe)["streams"][0]["pix_fmt"] == "yuv420p10le"
 
     output = tmp_path / "mixed.mp4"
     report = render(spec, output, root=tmp_path, ffmpeg=ffmpeg, ffprobe=ffprobe, source_cache=source_cache)
@@ -450,18 +459,18 @@ def test_renders_mixed_sdr_hlg_and_hdr10_with_matching_colors(tools, tmp_path):
     assert checksums(paths) == original
 
     starts, _ = layout(spec)
-    select_frames = "+".join(f"eq(n,{start + 60})" for start in starts[:3])
+    select_frames = "+".join(f"eq(n,{start + 60})" for start in starts[:4])
     raw = run(ffmpeg, "-threads", "2", "-i", output, "-an", "-vf",
               f"select='{select_frames}',scale=in_color_matrix=bt709,format=rgb24",
               "-fps_mode", "passthrough", "-threads", "1", "-f", "rawvideo", "-")
     frame_bytes = 1080 * 1920 * 3
-    assert len(raw) == 3 * frame_bytes
+    assert len(raw) == 4 * frame_bytes
     observed = []
     for offset in range(0, len(raw), frame_bytes):
         frame = Image.frombytes("RGB", (1080, 1920), raw[offset:offset + frame_bytes])
         anchors = [(104 + 216 * (i % 5), 812 + 288 * (i // 5)) for i in range(len(colors))]
         observed.append([tuple(ImageStat.Stat(frame.crop((x, y, x + 8, y + 8))).mean) for x, y in anchors])
-    print(f"Color patches SDR/HLG/PQ: {observed}; mixed render: {report['renderSeconds']}s")
+    print(f"Color patches SDR/HLG/PQ/odd HLG: {observed}; mixed render: {report['renderSeconds']}s")
     for actual in observed:
         for i, rgb in enumerate(actual):
             if len(set(colors[i])) == 1:

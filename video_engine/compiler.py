@@ -9,7 +9,8 @@ SDR_PEAK_NITS = 100
 
 def tone_map(source):
     level = "full" if source.range == "pc" else "limited"
-    return (f"zscale=pin=bt2020:tin={source.hdr_transfer}:min=bt2020nc:rin={level}:t=linear:npl={SDR_PEAK_NITS},"
+    full_chroma = "format=yuv444p16le," if source.width % 2 or source.height % 2 else ""
+    return (f"{full_chroma}zscale=pin=bt2020:tin={source.hdr_transfer}:min=bt2020nc:rin={level}:t=linear:npl={SDR_PEAK_NITS},"
             "format=gbrpf32le,setparams=colorspace=bt2020nc,"
             f"tonemap=mobius:param=0.75:desat=2:peak={source.hdr_peak_nits/SDR_PEAK_NITS:.8g},"
             "zscale=min=gbr:p=bt709:t=bt709:m=bt709:r=limited,format=yuv444p10le,"
