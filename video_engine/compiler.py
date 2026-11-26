@@ -6,6 +6,7 @@ SAMPLES_PER_FRAME = SAMPLE_RATE // FPS
 COLOR = "setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709"
 SDR_PEAK_NITS = 100
 PLANAR_420 = {"yuvj420p", "yuv420p", *(f"yuv420p{depth}le" for depth in (9, 10, 12, 14, 16))}
+PLANAR_422 = {"yuvj422p", "yuv422p", *(f"yuv422p{depth}le" for depth in (9, 10, 12, 14, 16))}
 CHROMA_LOCATIONS = {"left", "center", "topleft", "top", "bottomleft", "bottom"}
 
 
@@ -23,7 +24,7 @@ def tone_map(source, index):
                        f"setparams=range={level}:color_primaries=bt2020:color_trc={source.hdr_transfer}:colorspace=bt2020nc,")
             chroma_location = f":cin={chroma}"
             restore = f"crop={width}:{height}:0:0:exact=1,"
-        else:
+        elif not (source.pixel_format in PLANAR_422 and source.width % 2 == 0 and source.rotation in (0, 180)):
             prepare = "format=yuv444p16le,"
     return (f"{prepare}zscale=pin=bt2020:tin={source.hdr_transfer}:min=bt2020nc:rin={level}:"
             f"t=linear:npl={SDR_PEAK_NITS}{chroma_location},"

@@ -560,6 +560,33 @@ def test_renders_mixed_sdr_hlg_and_hdr10_with_matching_colors(tools, tmp_path):
     assert max_delta <= 16
 
 
+def test_odd_height_hlg_422_preserves_left_sited_chroma(tools, tmp_path):
+    ffmpeg, ffprobe = tools
+    profiles = []
+    for height in (96, 95):
+        path = tmp_path / f"hlg-422-{height}.mkv"
+        pattern = ("format=yuv422p10le,geq=lum='if(lt(X,36),200,520)':"
+                   f"cb='if(lt(X,18),420,580)':cr='if(lt(X,18),770,300)',crop=180:{height}:0:0,"
+                   "setparams=range=limited:color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc")
+        run(ffmpeg, "-f", "lavfi", "-i", "nullsrc=s=180x96:r=30", "-filter_threads", "1", "-vf", pattern,
+            "-frames:v", "1", "-c:v", "libx264", "-threads", "2", "-qp", "0", "-preset", "ultrafast",
+            "-chroma_sample_location", "left",
+            "-color_primaries", "bt2020", "-color_trc", "arib-std-b67", "-colorspace", "bt2020nc",
+            "-color_range", "tv", path)
+        source = inspect_source(path, ffprobe, ffmpeg=ffmpeg)
+        assert (source.width, source.height, source.pixel_format, source.chroma_location, source.hdr_transfer) == (
+            180, height, "yuv422p10le", "left", "arib-std-b67")
+        raw = run(ffmpeg, "-i", path, "-filter_threads", "1", "-vf",
+                  f"{tone_map(source, 0)}scale=in_color_matrix=bt709:in_range=tv,format=rgb24",
+                  "-frames:v", "1", "-threads", "1", "-f", "rawvideo", "-")
+        assert len(raw) == 180 * height * 3
+        frame = Image.frombytes("RGB", (180, height), raw)
+        profiles.append([frame.getpixel((x, 48)) for x in range(32, 41)])
+    max_delta = max(abs(a - b) for even, odd in zip(*profiles) for a, b in zip(even, odd))
+    print(f"Left-sited 4:2:2 edge (even / odd): {profiles}; max RGB delta: {max_delta}")
+    assert max_delta <= 4
+
+
 def test_reports_missing_hdr_filters(monkeypatch):
     def without_zscale(args):
         return subprocess.CompletedProcess(args, 0, stdout=b" .S. tonemap V->V filter\n")
