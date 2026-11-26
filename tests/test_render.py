@@ -4,9 +4,11 @@ import json
 import os
 import select
 import statistics
+import struct
 import subprocess
 import threading
 from array import array
+from colorsys import rgb_to_hsv
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from fractions import Fraction
@@ -16,13 +18,14 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageStat
 
 from video_engine import media, server as web
 from video_engine.branding import prepare_overlays, title_image
+from video_engine.compiler import tone_map
 from video_engine.media import command, inspect_source, require_tools
 from video_engine.planner import autoedit
-from video_engine.renderer import render
+from video_engine.renderer import render, require_hdr_filters
 from video_engine.server import CLIPS, LocalServer
 from video_engine.timeline import EngineError, layout, lengths
 from video_engine.verify import VIDEO_PROFILE
@@ -407,15 +410,202 @@ def test_mixed_joins_export(clips, tools, tmp_path, audio):
         assert report["audioDurationSeconds"] is None
 
 
-def test_rejects_invalid_and_hdr_without_export(tools, tmp_path):
+def test_renders_mixed_sdr_hlg_and_hdr10_with_matching_colors(tools, tmp_path):
+    ffmpeg, ffprobe = tools
+    colors = [(0, 0, 0), (115, 115, 115), (230, 230, 230), (255, 255, 255), (255, 255, 255),
+              (186, 124, 98), (186, 67, 57), (53, 176, 76), (63, 97, 185), (30, 30, 30)]
+    patches = [tuple((value / 255) ** 2.4 for value in color) for color in colors]
+    patches[3:5] = [(1.2, 1.2, 1.2), (8.0, 8.0, 8.0)]
+    wide_colors = [(1.0, 0.0, 0.0), (0.0, 1.0, 1.0), (0.0, 1.0, 0.0)]
+    patches.extend([*wide_colors, patches[9], patches[9]])
+    pattern = tmp_path / "patches.rgb"
+    samples = [1.2 if x == 178 or y == 94 else patches[5 * (y // 32) + x // 36][channel]
+               for channel in (1, 2, 0) for y in range(96) for x in range(180)]
+    pattern.write_bytes(struct.pack(f"<{len(samples)}f", *samples))
+
+    paths = [tmp_path / name for name in ("sdr.mp4", "hlg.mov", "pq.mp4", "odd-hlg.webm", "sdr2.mp4")]
+    for path, transfer in zip(paths[:4], ("bt709", "arib-std-b67", "smpte2084", "arib-std-b67")):
+        hdr = transfer != "bt709"
+        odd = path.suffix == ".webm"
+        primaries, matrix = ("bt2020", "bt2020nc") if hdr else ("bt709", "bt709")
+        pixel_format = "yuv420p10le" if hdr else "yuv420p"
+        params = "pools=1:frame-threads=1:lossless=1"
+        if transfer == "smpte2084":
+            params += ":max-cll=800,300:master-display=G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,50)"
+        encoder = "libx265" if hdr else "libx264"
+        compression = ["-x265-params", params, "-tag:v", "hvc1"] if hdr else ["-qp", "0"]
+        compression += ["-preset", "ultrafast"]
+        crop = ",crop=178:94:0:0" if path == paths[1] else ""
+        if odd:
+            encoder, compression = "libvpx-vp9", ["-profile:v", "2", "-lossless", "1"]
+            crop = ",crop=179:95:exact=1"
+        convert = f"tin=linear:min=gbr:rin=full:p={primaries}:t={transfer}:m={matrix}:r=limited:npl=100"
+        graph = f"zscale=pin=bt709:{convert},format={pixel_format}"
+        if hdr:
+            graph = (f"split[base][wide];[base]crop=180:64:0:0,{graph}[base709];"
+                     f"[wide]crop=180:32:0:64,zscale=pin=bt2020:{convert},format={pixel_format}[wide2020];"
+                     f"[base709][wide2020]vstack{crop},setparams=range=limited:"
+                     f"color_primaries={primaries}:color_trc={transfer}:colorspace={matrix}")
+        run(ffmpeg, "-stream_loop", "-1", "-f", "rawvideo", "-pixel_format", "gbrpf32le", "-video_size", "180x96",
+            "-framerate", "30", "-i", pattern, "-t", "6", "-filter_complex_threads", "1", "-filter_complex", graph,
+            "-c:v", encoder, "-threads", "2",
+            "-color_primaries", primaries, "-color_trc", transfer, "-colorspace", matrix, "-color_range", "tv",
+            *compression, path)
+    for copy in paths[4:]:
+        copy.write_bytes(paths[0].read_bytes())
+    original = checksums(paths)
+    source_cache = {}
+    spec = autoedit(paths, root=tmp_path, ffmpeg=ffmpeg, ffprobe=ffprobe, audio="mute", source_cache=source_cache)
+    sources = list(source_cache.values())
+    assert sources[0].hdr_transfer is None
+    assert (sources[1].hdr_transfer, sources[1].hdr_peak_nits) == ("arib-std-b67", 1000)
+    assert (sources[2].hdr_transfer, sources[2].hdr_peak_nits) == ("smpte2084", 800)
+    assert (sources[3].hdr_transfer, sources[3].width, sources[3].height) == ("arib-std-b67", 179, 95)
+    assert media.probe(paths[3], "-show_streams", ffprobe=ffprobe)["streams"][0]["pix_fmt"] == "yuv420p10le"
+
+    output = tmp_path / "mixed.mp4"
+    report = render(spec, output, root=tmp_path, ffmpeg=ffmpeg, ffprobe=ffprobe, source_cache=source_cache)
+    assert report["video"] == VIDEO_PROFILE and report["frames"] == 810
+    assert checksums(paths) == original
+
+    starts, _ = layout(spec)
+    select_frames = "+".join(f"eq(n,{start + 60})" for start in starts[:4])
+    yuv = run(ffmpeg, "-threads", "2", "-i", output, "-an", "-vf", f"select='{select_frames}'",
+              "-frames:v", "4", "-fps_mode", "passthrough", "-threads", "1", "-f", "rawvideo", "-")
+    yuv_frames = tmp_path / "export.yuv"
+    yuv_frames.write_bytes(yuv)
+    raw = run(ffmpeg, "-f", "rawvideo", "-pixel_format", "yuv420p", "-video_size", "1080x1920", "-i", yuv_frames,
+              "-vf", "scale=in_color_matrix=bt709:in_range=tv,format=rgb24", "-threads", "1", "-f", "rawvideo", "-")
+    frame_bytes = 1080 * 1920 * 3
+    assert len(raw) == 4 * frame_bytes
+    frames = [Image.frombytes("RGB", (1080, 1920), raw[offset:offset + frame_bytes])
+              for offset in range(0, len(raw), frame_bytes)]
+
+    def sample(frame, x, y, size=8):
+        return tuple(ImageStat.Stat(frame.crop((x, y, x + size, y + size))).mean)
+
+    anchors = [(104 + 216 * (i % 5), 764 + 192 * (i // 5)) for i in range(len(colors))]
+    observed = [[sample(frame, x, y) for x, y in anchors] for frame in frames]
+    print(f"Color patches SDR/HLG/PQ/odd HLG: {observed}; mixed render: {report['renderSeconds']}s")
+    for actual in observed:
+        for i, rgb in enumerate(actual):
+            if len(set(colors[i])) == 1:
+                assert max(rgb) - min(rgb) <= 4
+            assert rgb == pytest.approx(colors[i], abs=16)
+    for actual in observed[1:]:
+        assert max(actual[0]) <= 4 and min(actual[4]) >= 250
+        assert min(actual[4]) - max(actual[3]) >= 4
+        for tone_mapped, sdr in zip(actual, observed[0]):
+            assert tone_mapped == pytest.approx(sdr, abs=12)
+
+    luma_bytes = 1080 * 1920
+    chroma_bytes = luma_bytes // 4
+    for i, frame in enumerate(frames[1:], 1):
+        start = i * (luma_bytes + 2 * chroma_bytes)
+        y_plane = Image.frombytes("L", (1080, 1920), yuv[start:start + luma_bytes])
+        u_start = start + luma_bytes
+        v_start = u_start + chroma_bytes
+        chroma_planes = [Image.frombytes("L", (540, 960), yuv[o:o + chroma_bytes]) for o in (u_start, v_start)]
+        for j, expected_hue in enumerate((0, 180, 120)):
+            x, y = 104 + 216 * j, 1148
+            rgb = sample(frame, x, y)
+            hue, saturation, value = rgb_to_hsv(*(channel / 255 for channel in rgb))
+            hue_error = abs((360 * hue - expected_hue + 180) % 360 - 180)
+            assert hue_error <= 10, (i, j, rgb, hue_error)
+            assert saturation >= 0.6 and value >= 0.5, (i, j, rgb)
+            lo, hi = y_plane.crop((x, y, x + 8, y + 8)).getextrema()
+            assert 16 <= lo <= hi <= 235
+            for plane in chroma_planes:
+                lo, hi = plane.crop((x // 2, y // 2, x // 2 + 4, y // 2 + 4)).getextrema()
+                assert 16 <= lo <= hi <= 240
+            print(f"Wide-gamut patch {i}/{j}: {rgb}; hue error {hue_error:.1f}°")
+
+    edge_frames = []
+    for source in (sources[1], sources[3]):
+        raw = run(ffmpeg, "-i", source.path, "-filter_complex_threads", "1", "-filter_complex",
+                  f"{tone_map(source, 0)}scale=in_color_matrix=bt709:in_range=tv,format=rgb24",
+                  "-frames:v", "1", "-threads", "1", "-f", "rawvideo", "-")
+        dims = source.width, source.height
+        assert len(raw) == source.width * source.height * 3
+        edge_frames.append(Image.frombytes("RGB", dims, raw))
+
+    odd = edge_frames[1]
+    for border, inside in (((178, 48), (177, 48)), ((160, 94), (160, 93))):
+        assert min(odd.getpixel(border)) >= 235
+        assert max(odd.getpixel(inside)) <= 40
+    assert min(frames[3].getpixel((1077, 960))) >= 190
+    assert min(frames[3].getpixel((960, 1243))) >= 190
+
+    edge_frames = [frame.resize((frame.width * 6, frame.height * 6), Image.Resampling.BICUBIC)
+                   for frame in edge_frames]
+    edge_x, edge_y = 216, 480
+    profiles = [list(frame.crop((edge_x - 8, edge_y, edge_x + 9, edge_y + 1)).getdata())
+                for frame in edge_frames]
+
+    def midpoint_crossing(values, left, right):
+        midpoint = (left + right) / 2
+        direction = 1 if right > left else -1
+        i = next(i for i, value in enumerate(values) if (value - midpoint) * direction >= 0)
+        assert i > 0
+        return i - 1 + (midpoint - values[i - 1]) / (values[i] - values[i - 1])
+
+    crossings = []
+    for frame, profile in zip(edge_frames, profiles):
+        left, right = sample(frame, 104, edge_y), sample(frame, 320, edge_y)
+        crossings.append([midpoint_crossing(channel, lo, hi) - 8
+                          for channel, lo, hi in zip(zip(*profile), left, right)])
+    max_delta = max(abs(a - b) for even, odd in zip(*profiles) for a, b in zip(even, odd))
+    print(f"Chroma edge RGB crossings (even / odd): {crossings}; max per-pixel RGB delta: {max_delta}")
+    assert crossings[1] == pytest.approx(crossings[0], abs=1)
+    assert max_delta <= 16
+
+
+def test_odd_height_hlg_422_preserves_left_sited_chroma(tools, tmp_path):
+    ffmpeg, ffprobe = tools
+    profiles = []
+    for height in (96, 95):
+        path = tmp_path / f"hlg-422-{height}.mkv"
+        pattern = ("format=yuv422p10le,geq=lum='if(lt(X,36),200,520)':"
+                   f"cb='if(lt(X,18),420,580)':cr='if(lt(X,18),770,300)',crop=180:{height}:0:0,"
+                   "setparams=range=limited:color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc")
+        run(ffmpeg, "-f", "lavfi", "-i", "nullsrc=s=180x96:r=30", "-filter_threads", "1", "-vf", pattern,
+            "-frames:v", "1", "-c:v", "libx264", "-threads", "2", "-qp", "0", "-preset", "ultrafast",
+            "-chroma_sample_location", "left",
+            "-color_primaries", "bt2020", "-color_trc", "arib-std-b67", "-colorspace", "bt2020nc",
+            "-color_range", "tv", path)
+        source = inspect_source(path, ffprobe, ffmpeg=ffmpeg)
+        assert (source.width, source.height, source.pixel_format, source.chroma_location, source.hdr_transfer) == (
+            180, height, "yuv422p10le", "left", "arib-std-b67")
+        raw = run(ffmpeg, "-i", path, "-filter_threads", "1", "-vf",
+                  f"{tone_map(source, 0)}scale=in_color_matrix=bt709:in_range=tv,format=rgb24",
+                  "-frames:v", "1", "-threads", "1", "-f", "rawvideo", "-")
+        assert len(raw) == 180 * height * 3
+        frame = Image.frombytes("RGB", (180, height), raw)
+        profiles.append([frame.getpixel((x, 48)) for x in range(32, 41)])
+    max_delta = max(abs(a - b) for even, odd in zip(*profiles) for a, b in zip(even, odd))
+    print(f"Left-sited 4:2:2 edge (even / odd): {profiles}; max RGB delta: {max_delta}")
+    assert max_delta <= 4
+
+
+def test_reports_missing_hdr_filters(monkeypatch):
+    def without_zscale(args):
+        return subprocess.CompletedProcess(args, 0, stdout=b" .S. tonemap V->V filter\n")
+
+    monkeypatch.setattr("video_engine.renderer.command", without_zscale)
+    with pytest.raises(EngineError, match="zscale and tonemap.*ffmpeg-full"):
+        require_hdr_filters("ffmpeg")
+
+
+def test_rejects_invalid_and_unsupported_color_profile_without_export(tools, tmp_path):
     ffmpeg, ffprobe = tools
     corrupt = tmp_path / "bad.mp4"
     corrupt.write_bytes(b"not video")
     with pytest.raises(EngineError, match="cannot read source"):
         inspect_source(corrupt, ffprobe, ffmpeg=ffmpeg)
     hdr = tmp_path / "hdr.mp4"
-    run(ffmpeg, "-f", "lavfi", "-i", "color=green:s=96x96:d=1", "-c:v", "libx264", "-threads", "2",
-        "-color_trc", "arib-std-b67", "-color_primaries", "bt2020", "-colorspace", "bt2020nc", hdr)
+    run(ffmpeg, "-f", "lavfi", "-i", "color=green:s=96x96:d=1", "-vf",
+        "setparams=color_primaries=bt709:color_trc=arib-std-b67:colorspace=bt709",
+        "-c:v", "libx264", "-threads", "2", hdr)
     with pytest.raises(EngineError, match="unsupported color profile"):
         inspect_source(hdr, ffprobe, ffmpeg=ffmpeg)
 
