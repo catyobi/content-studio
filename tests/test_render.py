@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from fractions import Fraction
 from pathlib import Path
+from time import monotonic, sleep
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -261,6 +262,60 @@ def test_upload_survives_short_pause_and_cleans_up_after_idle_timeout(running_ed
                 assert reply["error"].startswith("Clip 5 upload: No data arrived")
                 assert not (folder / "clip5").exists()
             assert not (folder / "clip5.partial").exists()
+
+
+def test_sustained_upload_outlasts_both_timeouts(running_editor, monkeypatch):
+    editor = running_editor
+    monkeypatch.setattr(web, "REQUEST_TIMEOUT", 0.2)
+    monkeypatch.setattr(web, "UPLOAD_IDLE_TIMEOUT", 1.0)
+    status, reply = editor_request(editor, "POST", "/job")
+    assert status == 201
+    folder = editor.folder / reply["job"]
+    chunks = [bytes([i]) * 64 * 1024 for i in range(5)]
+    payload = b"".join(chunks)
+
+    def paced_body():
+        yield chunks[0]
+        for chunk in chunks[1:]:
+            sleep(0.3)
+            yield chunk
+
+    with closing(http.client.HTTPConnection("127.0.0.1", editor.server_port, timeout=5)) as connection:
+        started = monotonic()
+        connection.request("PUT", f"/job/{reply['job']}/clip5", paced_body(), {
+            "X-Video-Engine-Token": editor.token, "Content-Length": str(len(payload)),
+        })
+        response = connection.getresponse()
+        assert response.status == 200 and json.loads(response.read()) == {"ok": True}
+        assert monotonic() - started > web.UPLOAD_IDLE_TIMEOUT
+    assert (folder / "clip5").read_bytes() == payload
+    assert not list(folder.glob("*.partial"))
+
+
+def test_close_interrupts_stalled_upload_and_keeps_completed_copy(running_editor, monkeypatch):
+    editor = running_editor
+    monkeypatch.setattr(web, "UPLOAD_IDLE_TIMEOUT", 5.0)
+    status, reply = editor_request(editor, "POST", "/job")
+    assert status == 201
+    folder = editor.folder / reply["job"]
+    route = f"/job/{reply['job']}/clip5"
+    assert editor_request(editor, "PUT", route, b"original upload")[0] == 200
+
+    with closing(http.client.HTTPConnection("127.0.0.1", editor.server_port, timeout=5)) as connection:
+        connection.putrequest("PUT", route)
+        connection.putheader("X-Video-Engine-Token", editor.token)
+        connection.putheader("Content-Length", "2048")
+        connection.endheaders(b"x" * 1024)
+        deadline = monotonic() + 2
+        while not (folder / "clip5.partial").exists():
+            assert monotonic() < deadline, "The upload did not start."
+            sleep(0.01)
+        started = monotonic()
+        editor.shutdown()
+        editor.server_close()
+        assert monotonic() - started < 2
+        assert not (folder / "clip5.partial").exists()
+        assert (folder / "clip5").read_bytes() == b"original upload"
 
 
 @pytest.mark.parametrize(("option", "stage", "limit"), [("-show_streams", "Probing", 45), ("-progress", "Decoding", 180)])

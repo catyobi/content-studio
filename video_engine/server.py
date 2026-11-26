@@ -3,8 +3,10 @@ import json
 import re
 import secrets
 import shutil
+import socket
 import tempfile
 import threading
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -42,6 +44,9 @@ class LocalServer(ThreadingHTTPServer):
     daemon_threads = False
 
     def __init__(self, port, folder, ffmpeg, ffprobe):
+        self._upload_lock = threading.Lock()
+        self._upload_connection = None
+        self._uploads_closed = False
         super().__init__(("127.0.0.1", port), Handler)
         self.folder, self.ffmpeg, self.ffprobe = folder, ffmpeg, ffprobe
         self.token = secrets.token_hex(32)
@@ -51,6 +56,28 @@ class LocalServer(ThreadingHTTPServer):
         self.progress = None
         self.hosts = {f"127.0.0.1:{self.server_port}", f"localhost:{self.server_port}"}
         self.index = Path(__file__).with_name("index.html").read_text(encoding="utf-8").replace("__REQUEST_TOKEN__", self.token)
+
+    @contextmanager
+    def receiving_upload(self, connection):
+        with self._upload_lock:
+            if self._uploads_closed:
+                raise RequestError(503, "The local editor is shutting down.")
+            self._upload_connection = connection
+        try:
+            yield
+        finally:
+            with self._upload_lock:
+                self._upload_connection = None
+
+    def server_close(self):
+        with self._upload_lock:
+            self._uploads_closed = True
+            if self._upload_connection is not None:
+                try:
+                    self._upload_connection.shutdown(socket.SHUT_RD)
+                except OSError:
+                    pass
+        super().server_close()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -113,7 +140,7 @@ class Handler(BaseHTTPRequestHandler):
                 partial = job / f"{name}.partial"
                 self.request.settimeout(UPLOAD_IDLE_TIMEOUT)
                 try:
-                    with partial.open("wb") as handle:
+                    with self.server.receiving_upload(self.request), partial.open("wb") as handle:
                         while length:
                             try:
                                 chunk = self.rfile.read1(min(length, 1024**2))
