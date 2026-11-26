@@ -11,6 +11,8 @@ MAX_BYTES = 1024**3
 MAX_SECONDS = 180
 UNKNOWN = (None, "unknown", "unspecified", "reserved")
 NORMALIZE_CLOCK = f"setpts=PTS-STARTPTS,fps={FPS}"
+HDR_TRANSFERS = ("arib-std-b67", "smpte2084")
+DEFAULT_HDR_PEAK_NITS = 1000
 
 
 def command(args, *, timeout=45, capture=True, **kwargs):
@@ -47,6 +49,19 @@ def fraction(value, fallback=None):
         return fallback
 
 
+def hdr10_peak(path, video, ffprobe):
+    info = probe(path, "-select_streams", str(video["index"]), "-read_intervals", "%+#24",
+                 "-show_frames", "-show_entries", "frame=side_data_list", ffprobe=ffprobe)
+    side_data = [*video.get("side_data_list", []),
+                 *(item for frame in info.get("frames", []) for item in frame.get("side_data_list", []))]
+    for field in ("max_content", "max_luminance"):
+        for item in side_data:
+            peak = fraction(item.get(field))
+            if peak is not None and 100 < peak <= 10000:
+                return float(peak)
+    return DEFAULT_HDR_PEAK_NITS
+
+
 def decoded_frame_count(path, stream, ffmpeg):
     result = command([ffmpeg, "-hide_banner", "-nostdin", "-nostats", "-v", "error", "-copyts",
                       "-progress", "pipe:1", "-threads", "2", "-protocol_whitelist", "file", "-i", path,
@@ -71,6 +86,8 @@ class Source:
     range: str
     warning: str | None = None
     sar: Fraction = Fraction(1)
+    hdr_transfer: str | None = None
+    hdr_peak_nits: float | None = None
 
     @property
     def duration(self):
@@ -118,9 +135,12 @@ def inspect_source(path, ffprobe="ffprobe", *, ffmpeg="ffmpeg", source_cache=Non
         raise EngineError(f"{path.name}: only right-angle rotation metadata is supported.")
     primaries, transfer, space = (video.get(key) for key in ("color_primaries", "color_transfer", "color_space"))
     matrices = {"bt709": "bt709", "smpte170m": "bt601", "bt470bg": "bt601"}
-    if (primaries not in (*UNKNOWN, "bt709") or transfer not in (*UNKNOWN, "bt709")
-            or space not in (*UNKNOWN, *matrices)):
-        raise EngineError(f"{path.name}: unsupported color profile ({primaries}/{transfer}/{space}); use SDR BT.709 footage.")
+    hdr = primaries == "bt2020" and transfer in HDR_TRANSFERS and space == "bt2020nc"
+    if not hdr and (primaries not in (*UNKNOWN, "bt709") or transfer not in (*UNKNOWN, "bt709")
+                    or space not in (*UNKNOWN, *matrices)):
+        raise EngineError(f"{path.name}: unsupported color profile ({primaries}/{transfer}/{space}); "
+                          "use SDR BT.709 or BT.2020 HLG/HDR10 footage.")
+    peak = hdr10_peak(path, video, ffprobe) if hdr and transfer == "smpte2084" else DEFAULT_HDR_PEAK_NITS
     if on_decode is not None:
         on_decode()
     try:
@@ -134,10 +154,13 @@ def inspect_source(path, ffprobe="ffprobe", *, ffmpeg="ffmpeg", source_cache=Non
     warning = f"{path.name}: untagged color fields were assumed to be SDR BT.709 video." if any(
         value in UNKNOWN for value in (primaries, transfer, space, color_range)
     ) else None
+    if hdr and color_range in UNKNOWN:
+        warning = f"{path.name}: untagged HDR range was assumed to be limited."
     start = fraction(video.get("start_time"), fraction(container.get("start_time"), Fraction(0)))
     sar = fraction((video.get("sample_aspect_ratio") or "").replace(":", "/"), Fraction(1))
     source = Source(path, video["index"], audio, width, height, rotation, frames, start,
-                    matrices.get(space, "bt709"), "pc" if full else "tv", warning, sar=sar if sar > 0 else Fraction(1))
+                    matrices.get(space, "bt709"), "pc" if full else "tv", warning, sar=sar if sar > 0 else Fraction(1),
+                    hdr_transfer=transfer if hdr else None, hdr_peak_nits=peak if hdr else None)
     if source_cache is not None:
         if source_signature(path.stat()) != signature:
             raise EngineError(f"{path.name}: source changed during inspection; try again.")

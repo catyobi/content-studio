@@ -4,6 +4,7 @@ import json
 import os
 import select
 import statistics
+import struct
 import subprocess
 import threading
 from array import array
@@ -16,13 +17,13 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageStat
 
 from video_engine import media, server as web
 from video_engine.branding import prepare_overlays, title_image
 from video_engine.media import command, inspect_source, require_tools
 from video_engine.planner import autoedit
-from video_engine.renderer import render
+from video_engine.renderer import render, require_hdr_filters
 from video_engine.server import CLIPS, LocalServer
 from video_engine.timeline import EngineError, layout, lengths
 from video_engine.verify import VIDEO_PROFILE
@@ -407,15 +408,91 @@ def test_mixed_joins_export(clips, tools, tmp_path, audio):
         assert report["audioDurationSeconds"] is None
 
 
-def test_rejects_invalid_and_hdr_without_export(tools, tmp_path):
+def test_renders_mixed_sdr_hlg_and_hdr10_with_matching_colors(tools, tmp_path):
+    ffmpeg, ffprobe = tools
+    colors = [(0, 0, 0), (115, 115, 115), (230, 230, 230), (255, 255, 255), (255, 255, 255),
+              (186, 124, 98), (186, 67, 57), (53, 176, 76), (63, 97, 185), (30, 30, 30)]
+    patches = [tuple((value / 255) ** 2.4 for value in color) for color in colors]
+    patches[3:5] = [(1.2, 1.2, 1.2), (8.0, 8.0, 8.0)]
+    pattern = tmp_path / "patches.rgb"
+    samples = [patches[5 * (y // 48) + x // 36][channel]
+               for channel in (1, 2, 0) for y in range(96) for x in range(180)]
+    pattern.write_bytes(struct.pack(f"<{len(samples)}f", *samples))
+
+    paths = [tmp_path / name for name in ("sdr.mp4", "hlg.mov", "pq.mp4", "sdr2.mp4", "sdr3.mp4")]
+    for path, transfer in zip(paths[:3], ("bt709", "arib-std-b67", "smpte2084")):
+        hdr = transfer != "bt709"
+        primaries, matrix = ("bt2020", "bt2020nc") if hdr else ("bt709", "bt709")
+        pixel_format = "yuv420p10le" if hdr else "yuv420p"
+        params = "pools=1:frame-threads=1:lossless=1"
+        if transfer == "smpte2084":
+            params += ":max-cll=800,300:master-display=G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,50)"
+        compression = ["-x265-params", params, "-tag:v", "hvc1"] if hdr else ["-qp", "0"]
+        run(ffmpeg, "-stream_loop", "-1", "-f", "rawvideo", "-pixel_format", "gbrpf32le", "-video_size", "180x96",
+            "-framerate", "30", "-i", pattern, "-t", "6", "-filter_threads", "1", "-vf",
+            f"zscale=pin=bt709:tin=linear:min=gbr:rin=full:p={primaries}:t={transfer}:m={matrix}:r=limited:npl=100,"
+            f"format={pixel_format}", "-c:v", "libx265" if hdr else "libx264", "-threads", "2", "-preset", "ultrafast",
+            "-color_primaries", primaries, "-color_trc", transfer, "-colorspace", matrix, "-color_range", "tv",
+            *compression, path)
+    for copy in paths[3:]:
+        copy.write_bytes(paths[0].read_bytes())
+    original = checksums(paths)
+    source_cache = {}
+    spec = autoedit(paths, root=tmp_path, ffmpeg=ffmpeg, ffprobe=ffprobe, audio="mute", source_cache=source_cache)
+    sources = list(source_cache.values())
+    assert sources[0].hdr_transfer is None
+    assert (sources[1].hdr_transfer, sources[1].hdr_peak_nits) == ("arib-std-b67", 1000)
+    assert (sources[2].hdr_transfer, sources[2].hdr_peak_nits) == ("smpte2084", 800)
+
+    output = tmp_path / "mixed.mp4"
+    report = render(spec, output, root=tmp_path, ffmpeg=ffmpeg, ffprobe=ffprobe, source_cache=source_cache)
+    assert report["video"] == VIDEO_PROFILE and report["frames"] == 810
+    assert checksums(paths) == original
+
+    starts, _ = layout(spec)
+    select_frames = "+".join(f"eq(n,{start + 60})" for start in starts[:3])
+    raw = run(ffmpeg, "-threads", "2", "-i", output, "-an", "-vf",
+              f"select='{select_frames}',scale=in_color_matrix=bt709,format=rgb24",
+              "-fps_mode", "passthrough", "-threads", "1", "-f", "rawvideo", "-")
+    frame_bytes = 1080 * 1920 * 3
+    assert len(raw) == 3 * frame_bytes
+    observed = []
+    for offset in range(0, len(raw), frame_bytes):
+        frame = Image.frombytes("RGB", (1080, 1920), raw[offset:offset + frame_bytes])
+        anchors = [(104 + 216 * (i % 5), 812 + 288 * (i // 5)) for i in range(len(colors))]
+        observed.append([tuple(ImageStat.Stat(frame.crop((x, y, x + 8, y + 8))).mean) for x, y in anchors])
+    print(f"Color patches SDR/HLG/PQ: {observed}; mixed render: {report['renderSeconds']}s")
+    for actual in observed:
+        for i, rgb in enumerate(actual):
+            if len(set(colors[i])) == 1:
+                assert max(rgb) - min(rgb) <= 4
+            assert rgb == pytest.approx(colors[i], abs=16)
+    for actual in observed[1:]:
+        assert max(actual[0]) <= 4 and min(actual[4]) >= 250
+        assert min(actual[4]) - max(actual[3]) >= 4
+        for tone_mapped, sdr in zip(actual, observed[0]):
+            assert tone_mapped == pytest.approx(sdr, abs=12)
+
+
+def test_reports_missing_hdr_filters(monkeypatch):
+    def without_zscale(args):
+        return subprocess.CompletedProcess(args, 0, stdout=b" .S. tonemap V->V filter\n")
+
+    monkeypatch.setattr("video_engine.renderer.command", without_zscale)
+    with pytest.raises(EngineError, match="zscale and tonemap.*ffmpeg-full"):
+        require_hdr_filters("ffmpeg")
+
+
+def test_rejects_invalid_and_unsupported_color_profile_without_export(tools, tmp_path):
     ffmpeg, ffprobe = tools
     corrupt = tmp_path / "bad.mp4"
     corrupt.write_bytes(b"not video")
     with pytest.raises(EngineError, match="cannot read source"):
         inspect_source(corrupt, ffprobe, ffmpeg=ffmpeg)
     hdr = tmp_path / "hdr.mp4"
-    run(ffmpeg, "-f", "lavfi", "-i", "color=green:s=96x96:d=1", "-c:v", "libx264", "-threads", "2",
-        "-color_trc", "arib-std-b67", "-color_primaries", "bt2020", "-colorspace", "bt2020nc", hdr)
+    run(ffmpeg, "-f", "lavfi", "-i", "color=green:s=96x96:d=1", "-vf",
+        "setparams=color_primaries=bt709:color_trc=arib-std-b67:colorspace=bt709",
+        "-c:v", "libx264", "-threads", "2", hdr)
     with pytest.raises(EngineError, match="unsupported color profile"):
         inspect_source(hdr, ffprobe, ffmpeg=ffmpeg)
 

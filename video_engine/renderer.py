@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 from pathlib import Path
 from time import perf_counter
@@ -8,6 +9,14 @@ from .compiler import build_graph
 from .media import command, inspect_source, require_tools
 from .timeline import EngineError, asset_path, validate_spec
 from .verify import assert_branches, verify
+
+
+def require_hdr_filters(ffmpeg):
+    result = command([ffmpeg, "-hide_banner", "-filters"])
+    filters = set(re.findall(rb"^\s*[.A-Z]+\s+(\w+)\s+", result.stdout, re.MULTILINE))
+    if not {b"zscale", b"tonemap"} <= filters:
+        raise EngineError("HDR clips need FFmpeg with the zscale and tonemap filters. "
+                          "On macOS, use Homebrew's ffmpeg-full build.")
 
 
 def render(spec, output, *, root, ffmpeg="ffmpeg", ffprobe="ffprobe", source_cache=None, on_verify=None):
@@ -20,6 +29,8 @@ def render(spec, output, *, root, ffmpeg="ffmpeg", ffprobe="ffprobe", source_cac
         raise EngineError("Output already exists; choose a new filename. Sources are never overwritten.")
     sources = [inspect_source(asset_path(root, item["path"]), ffprobe, ffmpeg=ffmpeg, source_cache=source_cache)
                for item in spec["clips"]]
+    if any(source.hdr_transfer for source in sources):
+        require_hdr_filters(ffmpeg)
     for i, (clip, source) in enumerate(zip(spec["clips"], sources), 1):
         if clip["outFrame"] > source.frames:
             raise EngineError(f"Clip {i} trim exceeds available media ({source.frames} normalized frames).")

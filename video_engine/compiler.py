@@ -4,6 +4,17 @@ from .timeline import FPS, layout, lengths
 SAMPLE_RATE = 48000
 SAMPLES_PER_FRAME = SAMPLE_RATE // FPS
 COLOR = "setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709"
+SDR_PEAK_NITS = 100
+
+
+def tone_map(source):
+    level = "full" if source.range == "pc" else "limited"
+    return (f"zscale=pin=bt2020:tin={source.hdr_transfer}:min=bt2020nc:rin={level}:t=linear:npl={SDR_PEAK_NITS},"
+            "format=gbrpf32le,setparams=colorspace=bt2020nc,"
+            f"tonemap=mobius:param=0.75:desat=2:peak={source.hdr_peak_nits/SDR_PEAK_NITS:.8g},"
+            "zscale=min=gbr:p=bt709:t=bt709:m=bt709:r=limited,format=yuv444p10le,"
+            "sidedata=delete:type=MASTERING_DISPLAY_METADATA,sidedata=delete:type=CONTENT_LIGHT_LEVEL,"
+            "sidedata=delete:type=DYNAMIC_HDR_PLUS,")
 
 
 def framing(fit, matrix, level, background):
@@ -25,10 +36,12 @@ def build_graph(spec, sources, overlays):
     starts, _ = layout(spec)
     for i, (clip, source) in enumerate(zip(spec["clips"], sources)):
         start, end = clip["inFrame"], clip["outFrame"]
-        fit = framing(clip["fit"], source.matrix, source.range, spec["branding"]["backgroundColor"])
+        hdr = tone_map(source) if source.hdr_transfer else ""
+        matrix, level = ("bt709", "tv") if hdr else (source.matrix, source.range)
+        fit = framing(clip["fit"], matrix, level, spec["branding"]["backgroundColor"])
         graph.append(f"[{i}:{source.video}]{NORMALIZE_CLOCK},"
                      f"trim=start_frame={start}:end_frame={end},setpts=PTS-STARTPTS,fps={FPS},settb=1/{FPS},"
-                     f"{fit},setsar=1,{COLOR},showinfo@clip{i}=checksum=0[v{i}]")
+                     f"{hdr}{fit},setsar=1,{COLOR},showinfo@clip{i}=checksum=0[v{i}]")
         if keep and source.audio is None:
             graph.append(f"anullsrc=r={SAMPLE_RATE}:cl=stereo,atrim=end_sample={(end-start)*SAMPLES_PER_FRAME},"
                          f"aformat=sample_fmts=fltp[a{i}]")
