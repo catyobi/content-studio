@@ -86,7 +86,7 @@ def source_signature(stat):
     return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
 
 
-def inspect_source(path, ffprobe="ffprobe", *, ffmpeg="ffmpeg", source_cache=None):
+def inspect_source(path, ffprobe="ffprobe", *, ffmpeg="ffmpeg", source_cache=None, on_decode=None):
     stat = path.stat()
     if stat.st_size > MAX_BYTES:
         raise EngineError(f"{path.name}: source exceeds 1 GiB.")
@@ -121,6 +121,8 @@ def inspect_source(path, ffprobe="ffprobe", *, ffmpeg="ffmpeg", source_cache=Non
     if (primaries not in (*UNKNOWN, "bt709") or transfer not in (*UNKNOWN, "bt709")
             or space not in (*UNKNOWN, *matrices)):
         raise EngineError(f"{path.name}: unsupported color profile ({primaries}/{transfer}/{space}); use SDR BT.709 footage.")
+    if on_decode is not None:
+        on_decode()
     try:
         frames = decoded_frame_count(path, video["index"], ffmpeg)
     except EngineError as exc:
