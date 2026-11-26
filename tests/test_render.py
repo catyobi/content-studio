@@ -415,7 +415,7 @@ def test_renders_mixed_sdr_hlg_and_hdr10_with_matching_colors(tools, tmp_path):
               (186, 124, 98), (186, 67, 57), (53, 176, 76), (63, 97, 185), (30, 30, 30)]
     patches = [tuple((value / 255) ** 2.4 for value in color) for color in colors]
     patches[3:5] = [(1.2, 1.2, 1.2), (8.0, 8.0, 8.0)]
-    wide_colors = [(1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 1.0, 1.0)]
+    wide_colors = [(1.0, 0.0, 0.0), (0.0, 1.0, 1.0), (0.0, 1.0, 0.0)]
     patches.extend([*wide_colors, patches[9], patches[9]])
     pattern = tmp_path / "patches.rgb"
     samples = [patches[5 * (y // 32) + x // 36][channel]
@@ -434,7 +434,7 @@ def test_renders_mixed_sdr_hlg_and_hdr10_with_matching_colors(tools, tmp_path):
         encoder = "libx265" if hdr else "libx264"
         compression = ["-x265-params", params, "-tag:v", "hvc1"] if hdr else ["-qp", "0"]
         compression += ["-preset", "ultrafast"]
-        crop = ""
+        crop = ",crop=178:94:0:0" if path == paths[1] else ""
         if odd:
             encoder, compression = "libvpx-vp9", ["-profile:v", "2", "-lossless", "1"]
             crop = ",crop=179:95:exact=1"
@@ -505,7 +505,7 @@ def test_renders_mixed_sdr_hlg_and_hdr10_with_matching_colors(tools, tmp_path):
         u_start = start + luma_bytes
         v_start = u_start + chroma_bytes
         chroma_planes = [Image.frombytes("L", (540, 960), yuv[o:o + chroma_bytes]) for o in (u_start, v_start)]
-        for j, expected_hue in enumerate((0, 120, 180)):
+        for j, expected_hue in enumerate((0, 180, 120)):
             x, y = 104 + 216 * j, 1148
             rgb = sample(frame, x, y)
             hue, saturation, value = rgb_to_hsv(*(channel / 255 for channel in rgb))
@@ -519,11 +519,27 @@ def test_renders_mixed_sdr_hlg_and_hdr10_with_matching_colors(tools, tmp_path):
                 assert 16 <= lo <= hi <= 240
             print(f"Wide-gamut patch {i}/{j}: {rgb}; hue error {hue_error:.1f}°")
 
-    for offset in (-12, 12):
-        even = sample(frames[1], 216 + offset, 1148, size=2)
-        odd = sample(frames[3], round(36 * 1080 / 179) + offset, 1148, size=2)
-        print(f"Chroma edge {offset:+}: even {even}, odd {odd}")
-        assert odd == pytest.approx(even, abs=16)
+    edge_x = round(36 * 1080 / sources[1].width)
+    edge_y = 1148
+    profiles = [list(frame.crop((edge_x - 8, edge_y, edge_x + 9, edge_y + 1)).getdata())
+                for frame in (frames[1], frames[3])]
+
+    def midpoint_crossing(values, left, right):
+        midpoint = (left + right) / 2
+        direction = 1 if right > left else -1
+        i = next(i for i, value in enumerate(values) if (value - midpoint) * direction >= 0)
+        assert i > 0
+        return i - 1 + (midpoint - values[i - 1]) / (values[i] - values[i - 1])
+
+    crossings = []
+    for frame, profile in zip((frames[1], frames[3]), profiles):
+        left, right = sample(frame, 104, edge_y), sample(frame, 320, edge_y)
+        crossings.append([midpoint_crossing(channel, lo, hi) - 8
+                          for channel, lo, hi in zip(zip(*profile), left, right)])
+    max_delta = max(abs(a - b) for even, odd in zip(*profiles) for a, b in zip(even, odd))
+    print(f"Chroma edge RGB crossings (even / odd): {crossings}; max per-pixel RGB delta: {max_delta}")
+    assert crossings[1] == pytest.approx(crossings[0], abs=1)
+    assert max_delta <= 16
 
 
 def test_reports_missing_hdr_filters(monkeypatch):
