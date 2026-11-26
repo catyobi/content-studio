@@ -301,7 +301,23 @@ def test_close_interrupts_stalled_upload_and_keeps_completed_copy(running_editor
     route = f"/job/{reply['job']}/clip5"
     assert editor_request(editor, "PUT", route, b"original upload")[0] == 200
 
-    with closing(http.client.HTTPConnection("127.0.0.1", editor.server_port, timeout=5)) as connection:
+    queued = threading.Event()
+    lock = editor.lock
+
+    class ObservedLock:
+        def __enter__(self):
+            if not lock.acquire(blocking=False):
+                queued.set()
+                lock.acquire()
+
+        def __exit__(self, *_):
+            lock.release()
+
+    monkeypatch.setattr(editor, "lock", ObservedLock())
+    with (
+        closing(http.client.HTTPConnection("127.0.0.1", editor.server_port, timeout=5)) as connection,
+        closing(http.client.HTTPConnection("127.0.0.1", editor.server_port, timeout=5)) as queued_connection,
+    ):
         connection.putrequest("PUT", route)
         connection.putheader("X-Video-Engine-Token", editor.token)
         connection.putheader("Content-Length", "2048")
@@ -310,11 +326,19 @@ def test_close_interrupts_stalled_upload_and_keeps_completed_copy(running_editor
         while not (folder / "clip5.partial").exists():
             assert monotonic() < deadline, "The upload did not start."
             sleep(0.01)
+        queued_connection.putrequest("PUT", f"/job/{reply['job']}/clip4")
+        queued_connection.putheader("X-Video-Engine-Token", editor.token)
+        queued_connection.putheader("Content-Length", "2048")
+        queued_connection.endheaders(b"y" * 1024)
+        assert queued.wait(2), "The second upload did not contend for the job lock."
+
         started = monotonic()
         editor.shutdown()
         editor.server_close()
         assert monotonic() - started < 2
-        assert not (folder / "clip5.partial").exists()
+        assert queued_connection.getresponse().status == 503
+        assert not list(folder.glob("*.partial"))
+        assert not (folder / "clip4").exists()
         assert (folder / "clip5").read_bytes() == b"original upload"
 
 
